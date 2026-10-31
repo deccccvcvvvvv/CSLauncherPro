@@ -1,64 +1,126 @@
 package pro.cslauncher.core.settings
 
-import kotlinx.coroutines.flow.*
 import kotlinx.serialization.Serializable
-import pro.cslauncher.core.util.*
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
+import pro.cslauncher.core.util.CsJson
+import pro.cslauncher.core.util.CsLog
+import pro.cslauncher.core.util.FsUtil
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import java.nio.file.Files
 import java.nio.file.Path
 
-/** PIXEL is the blocky, Pocket-Edition-inspired default; the earlier smooth themes stay available. */
-@Serializable enum class ThemeChoice { MINECRAFT_LAUNCHER, PIXEL, DARK_GRAPHITE, GLASSMORPHISM }
-@Serializable enum class PerformancePreset { BATTERY_SAVER, BALANCED, PERFORMANCE, CUSTOM }
-@Serializable enum class CursorMode { DESKTOP, TOUCHPAD, IMMERSIVE, SMART }
-@Serializable enum class CursorShape { ARROW, CIRCLE, CROSSHAIR, DOT, HAND, IBEAM, RESIZE_NS, RESIZE_EW, RESIZE_ALL, NOT_ALLOWED }
-@Serializable enum class AudioSourceChoice { NONE, MICROPHONE, GAME_AUDIO, GAME_AND_MICROPHONE }
-@Serializable enum class RecordingQuality { LOW, BALANCED, HIGH, CUSTOM }
-@Serializable enum class RecordingResolution { P480, P720, P1080, NATIVE }
-@Serializable enum class TapAction { NONE, MOUSE_LEFT, MOUSE_RIGHT }
+@Serializable
+enum class ThemeChoice { MINECRAFT_LAUNCHER, PIXEL, DARK_GRAPHITE, GLASSMORPHISM }
 
-@Serializable data class CursorSettings(
-    val mode: CursorMode = CursorMode.SMART, val shape: CursorShape = CursorShape.ARROW, val sizeDp: Float = 22f, val opacity: Float = 0.95f,
-    val colorArgb: Long = 0xFFF0F1F5, val sensitivity: Float = 1.0f, val smoothing: Float = 0f, val clickAnimation: Boolean = true,
-    val trail: Boolean = false, val selectionHighlight: Boolean = true, val externalMouse: Boolean = true,
+@Serializable
+enum class CursorMode { DESKTOP, TOUCHPAD, IMMERSIVE, SMART }
+
+@Serializable
+enum class CursorShape { ARROW, CIRCLE, CROSSHAIR, DOT, HAND, IBEAM, RESIZE_NS, RESIZE_EW, RESIZE_ALL, NOT_ALLOWED }
+
+@Serializable
+enum class AudioSourceChoice { NONE, MICROPHONE, GAME_AUDIO, GAME_AND_MICROPHONE }
+
+@Serializable
+enum class PerformancePreset { BATTERY_SAVER, BALANCED, PERFORMANCE, CUSTOM }
+
+@Serializable
+enum class RecordingQuality { LOW, BALANCED, HIGH, CUSTOM }
+
+@Serializable
+enum class RecordingResolution { P480, P720, P1080, NATIVE }
+
+@Serializable
+enum class TapAction { NONE, MOUSE_LEFT, MOUSE_RIGHT }
+
+@Serializable
+data class TouchSettings(
+    val lookSensitivityX: Float = 1.0f,
+    val lookSensitivityY: Float = 1.0f,
+    val invertY: Boolean = false,
+    val smoothing: Float = 0f,
+    val acceleration: Float = 0f,
+    val tapAction: TapAction = TapAction.MOUSE_RIGHT,
+    val longPressBreak: Boolean = true,
+    val longPressMs: Int = 320,
+    val hideOverlayWithPhysicalInput: Boolean = true,
+    val vibrateOnPress: Boolean = false,
+    val safeAreaPaddingDp: Float = 8f,
+    /** Global multipliers applied on top of every control's own opacity/size (live from the in-game menu). */
+    val controlsOpacity: Float = 1f,
+    val controlsScale: Float = 1f,
+    val showMenuHandle: Boolean = true,
+    val showFpsHud: Boolean = false
 )
 
-/** Virtual mouse on = touchpad pointer in menus; off = direct touch (pointer shown at the finger unless hidden). */
-fun CursorSettings.withVirtualMouse(on: Boolean): CursorSettings =
-    if (on) copy(mode = CursorMode.TOUCHPAD) else if (mode == CursorMode.TOUCHPAD) copy(mode = CursorMode.SMART) else this
-/** Direct-touch only: whether the pointer is drawn where the finger touches (SMART) or not at all (IMMERSIVE). */
-fun CursorSettings.withPointerOnTouch(show: Boolean): CursorSettings = when {
-    mode == CursorMode.TOUCHPAD -> this
-    show -> copy(mode = if (mode == CursorMode.IMMERSIVE) CursorMode.SMART else mode)
-    else -> copy(mode = CursorMode.IMMERSIVE)
-}
+@Serializable
+data class CursorSettings(
+    val mode: CursorMode = CursorMode.SMART,
+    val shape: CursorShape = CursorShape.ARROW,
+    val sizeDp: Float = 22f,
+    val opacity: Float = 0.95f,
+    val colorArgb: Long = 0xFFF0F1F5,
+    val sensitivity: Float = 1.0f,
+    val smoothing: Float = 0f,
+    val clickAnimation: Boolean = true,
+    val trail: Boolean = false,
+    val selectionHighlight: Boolean = true,
+    val externalMouse: Boolean = true
+)
+
+@Serializable
+data class TouchpadConfig(
+    val sizeFraction: Float = 0.45f,
+    val deadZone: Float = 0.02f,
+    val sensitivity: Float = 1.2f,
+    val tapToClick: Boolean = true,
+    val twoFingerScroll: Boolean = true
+)
+
+@Serializable
+data class RecordingSettings(
+    val resolution: RecordingResolution = RecordingResolution.P720,
+    val fps: Int = 30,
+    val quality: RecordingQuality = RecordingQuality.BALANCED,
+    val customBitrateKbps: Int = 6000,
+    val preferHevc: Boolean = false,
+    val audio: AudioSourceChoice = AudioSourceChoice.GAME_AUDIO,
+    val saveToGallery: Boolean = false,
+    val showOverlay: Boolean = true,
+    val overlayX: Float = 0.02f,
+    val overlayY: Float = 0.08f,
+    val hideControls: Boolean = true
+)
+
+data class ValidationProblem(val field: String, val message: String)
+
+/** A virtual mouse exists whenever the cursor is not permanently captured by touch look. */
 val CursorSettings.pointerOnTouch: Boolean get() = mode != CursorMode.IMMERSIVE
 
-@Serializable data class TouchSettings(
-    val lookSensitivityX: Float = 1.0f, val lookSensitivityY: Float = 1.0f, val invertY: Boolean = false, val smoothing: Float = 0f,
-    val acceleration: Float = 0f, val tapAction: TapAction = TapAction.MOUSE_RIGHT, val longPressBreak: Boolean = true, val longPressMs: Int = 320,
-    val hideOverlayWithPhysicalInput: Boolean = true, val vibrateOnPress: Boolean = false, val safeAreaPaddingDp: Float = 8f,
-    /** Global multipliers applied on top of every control's own opacity / size (live, from the in-game menu). */
-    val controlsOpacity: Float = 1f, val controlsScale: Float = 1f,
-    /** Small always-available tab at the top edge that opens the in-game menu, independent of the layout. */
-    val showMenuHandle: Boolean = true,
-    /** Frame-rate / memory read-out in the corner while playing. */
-    val showFpsHud: Boolean = false,
-)
+fun CursorSettings.withVirtualMouse(on: Boolean): CursorSettings =
+    if (on) copy(mode = CursorMode.SMART) else copy(mode = CursorMode.IMMERSIVE)
 
-@Serializable data class RecordingSettings(
-    val resolution: RecordingResolution = RecordingResolution.P720, val fps: Int = 30, val quality: RecordingQuality = RecordingQuality.BALANCED,
-    val customBitrateKbps: Int = 6000, val preferHevc: Boolean = false, val audio: AudioSourceChoice = AudioSourceChoice.GAME_AUDIO,
-    val saveToGallery: Boolean = false, val showOverlay: Boolean = true, val overlayX: Float = 0.02f, val overlayY: Float = 0.08f,
-    /** Clean video: frames are copied from the game's own GL surface, so touch controls, menus and the indicator never appear. */
-    val hideControls: Boolean = true,
-)
+fun CursorSettings.withPointerOnTouch(show: Boolean): CursorSettings =
+    if (show) copy(mode = CursorMode.SMART) else copy(mode = CursorMode.IMMERSIVE)
 
-@Serializable data class LauncherSettings(
-    val schemaVersion: Int = LauncherSettings.SCHEMA,
+/**
+ * All launcher settings.
+ *
+ * Every field has a working default so a fresh install is usable without opening the settings
+ * screen, and the schema version lets a future release migrate rather than reset a user's choices.
+ */
+@Serializable
+data class LauncherSettings(
+    val schemaVersion: Int = SCHEMA,
     val theme: ThemeChoice = ThemeChoice.MINECRAFT_LAUNCHER,
-    /** Animated pixel landscape behind the launcher (paused when hidden, static with reduced motion). */
     val animatedBackground: Boolean = false,
-    /** Hide the status and navigation bars in the launcher (swipe from an edge to show them briefly). */
     val fullscreenLauncher: Boolean = true,
     val reduceTransparency: Boolean = false,
     val reduceMotion: Boolean = true,
@@ -76,50 +138,143 @@ val CursorSettings.pointerOnTouch: Boolean get() = mode != CursorMode.IMMERSIVE
     val defaultResolutionWidth: Int? = null,
     val defaultResolutionHeight: Int? = null,
     val startupScreen: String = "HOME",
-
     val performancePreset: PerformancePreset = PerformancePreset.BALANCED,
-    val frameRateLimit: Int = 0,              // 0 = unlimited (game setting is authoritative)
+    val frameRateLimit: Int = 0,
     val touch: TouchSettings = TouchSettings(),
     val cursor: CursorSettings = CursorSettings(),
     val recording: RecordingSettings = RecordingSettings(),
-    val msaClientId: String = "",             // Kept for refreshing existing Azure v2 accounts; new users are not asked for an ID.
+    val msaClientId: String = "",
     val verboseDiagnostics: Boolean = false,
-    val keepLauncherLogsDays: Int = 14,
+    val keepLauncherLogsDays: Int = 14
 ) {
     companion object {
         const val SCHEMA = 3
-        /** v3 moves the old default pixel UI to the clean launcher theme and disables motion-heavy defaults. */
+
+        /**
+         * Schema upgrade. A migration must never lose a user's choices: only fields whose meaning
+         * changed are rewritten, everything else is carried over untouched.
+         */
         fun migrate(s: LauncherSettings): LauncherSettings {
             if (s.schemaVersion >= SCHEMA) return s
-            val wasPixelDefault = s.theme == ThemeChoice.PIXEL
-            return s.copy(
-                schemaVersion = SCHEMA,
-                theme = if (wasPixelDefault) ThemeChoice.MINECRAFT_LAUNCHER else s.theme,
-                animatedBackground = if (wasPixelDefault) false else s.animatedBackground,
-                reduceMotion = if (wasPixelDefault) true else s.reduceMotion,
-            )
+            var out = s
+            if (s.schemaVersion < 2) {
+                // v2 introduced per-field validation; clamp values that used to be free-form.
+                out = out.copy(
+                    downloadConcurrency = s.downloadConcurrency.coerceIn(1, 16),
+                    downloadAttempts = s.downloadAttempts.coerceIn(1, 8)
+                )
+            }
+            if (s.schemaVersion < 3) {
+                // v3 moved the old default pixel UI to the clean launcher theme.
+                val wasPixelDefault = s.theme == ThemeChoice.PIXEL
+                out = out.copy(
+                    theme = if (wasPixelDefault) ThemeChoice.MINECRAFT_LAUNCHER else s.theme,
+                    animatedBackground = if (wasPixelDefault) false else s.animatedBackground,
+                    reduceMotion = if (wasPixelDefault) true else s.reduceMotion
+                )
+            }
+            return out.copy(schemaVersion = SCHEMA)
         }
+
+        /** Clamps anything a text field or an old file could contain into a usable range. */
+        fun sanitize(s: LauncherSettings): LauncherSettings = s.copy(
+            schemaVersion = SCHEMA,
+            downloadConcurrency = s.downloadConcurrency.coerceIn(1, 16),
+            downloadAttempts = s.downloadAttempts.coerceIn(1, 8),
+            defaultMemoryMb = s.defaultMemoryMb?.coerceIn(512, 65536),
+            defaultResolutionWidth = s.defaultResolutionWidth?.coerceIn(320, 7680),
+            defaultResolutionHeight = s.defaultResolutionHeight?.coerceIn(240, 4320),
+            frameRateLimit = s.frameRateLimit.coerceIn(0, 240),
+            keepLauncherLogsDays = s.keepLauncherLogsDays.coerceIn(1, 365),
+            touch = s.touch.copy(
+                lookSensitivityX = s.touch.lookSensitivityX.coerceIn(0.1f, 4f),
+                lookSensitivityY = s.touch.lookSensitivityY.coerceIn(0.1f, 4f),
+                smoothing = s.touch.smoothing.coerceIn(0f, 1f),
+                acceleration = s.touch.acceleration.coerceIn(0f, 1f),
+                longPressMs = s.touch.longPressMs.coerceIn(120, 1500),
+                controlsOpacity = s.touch.controlsOpacity.coerceIn(0.1f, 1f),
+                controlsScale = s.touch.controlsScale.coerceIn(0.5f, 2f),
+                safeAreaPaddingDp = s.touch.safeAreaPaddingDp.coerceIn(0f, 64f)
+            ),
+            cursor = s.cursor.copy(
+                sizeDp = s.cursor.sizeDp.coerceIn(8f, 64f),
+                opacity = s.cursor.opacity.coerceIn(0.1f, 1f),
+                sensitivity = s.cursor.sensitivity.coerceIn(0.2f, 5f),
+                smoothing = s.cursor.smoothing.coerceIn(0f, 1f)
+            ),
+            recording = s.recording.copy(
+                fps = s.recording.fps.coerceIn(15, 60),
+                customBitrateKbps = s.recording.customBitrateKbps.coerceIn(500, 120_000),
+                overlayX = s.recording.overlayX.coerceIn(0f, 1f),
+                overlayY = s.recording.overlayY.coerceIn(0f, 1f)
+            )
+        )
     }
 }
 
+/**
+ * Settings with an atomic, observable store.
+ *
+ * Two processes write here (the launcher and, while a game runs, the in-game menu), so every save is
+ * atomic and [reload] exists for the other process to pick up a change. A corrupt file is preserved
+ * as a `.corrupt-<timestamp>` copy instead of being silently overwritten: losing a user's settings
+ * without a trace is unacceptable.
+ */
 class SettingsStore(private val file: Path) {
+
     private val _state = MutableStateFlow(read())
     val state: StateFlow<LauncherSettings> = _state.asStateFlow()
 
+    val current: LauncherSettings get() = _state.value
+
     private fun read(): LauncherSettings = runCatching {
-        if (!Files.isRegularFile(file)) LauncherSettings() else LauncherSettings.migrate(CsJson.decodeFromString(LauncherSettings.serializer(), pro.cslauncher.core.util.FsUtil.readText(file)))
+        if (!Files.isRegularFile(file)) {
+            LauncherSettings()
+        } else {
+            LauncherSettings.sanitize(
+                LauncherSettings.migrate(CsJson.decodeFromString(LauncherSettings.serializer(), FsUtil.readText(file)))
+            )
+        }
     }.getOrElse { e ->
-        CsLog.w("Settings", "Settings file unreadable, keeping a copy and using defaults: ${e.message}")
-        runCatching { Files.copy(file, file.resolveSibling("settings.corrupt-${System.currentTimeMillis()}.json")) }
+        CsLog.w("Settings", "Settings unreadable, keeping a copy and using defaults: ${e.message}")
+        runCatching {
+            Files.copy(file, file.resolveSibling("settings.corrupt-${System.currentTimeMillis()}.json"))
+        }
         LauncherSettings()
     }
 
-    /** Re-reads the file: the launcher and the game process each hold a store and both may save (e.g. the in-game menu). */
-    @Synchronized fun reload() { _state.value = read() }
+    /** Re-reads the file: the launcher and the game process each hold a store and both may save. */
+    @Synchronized
+    fun reload() {
+        _state.value = read()
+    }
 
-    @Synchronized fun update(transform: (LauncherSettings) -> LauncherSettings) {
-        val next = transform(_state.value)
+    @Synchronized
+    fun update(transform: (LauncherSettings) -> LauncherSettings) {
+        val next = LauncherSettings.sanitize(transform(_state.value)).copy(schemaVersion = LauncherSettings.SCHEMA)
         FsUtil.writeAtomic(file, CsJson.encodeToString(LauncherSettings.serializer(), next))
         _state.value = next
     }
+
+    /** Exports the settings that a bug report should contain (no tokens, no file paths). */
+    fun exportForReport(): String {
+        val s = _state.value
+        return buildJsonObject {
+            put("schemaVersion", s.schemaVersion)
+            put("theme", s.theme.name)
+            put("renderer", s.defaultRenderer)
+            put("memoryMb", s.defaultMemoryMb ?: -1)
+            put("performancePreset", s.performancePreset.name)
+            put("downloadConcurrency", s.downloadConcurrency)
+            put("reduceMotion", s.reduceMotion)
+            putJsonObject("touch") {
+                put("opacity", s.touch.controlsOpacity)
+                put("scale", s.touch.controlsScale)
+            }
+            putJsonObject("cursor") { put("mode", s.cursor.mode.name) }
+        }.toString()
+    }
+
+    /** True when nothing has been written yet, so the UI can show first-run defaults honestly. */
+    fun exists(): Boolean = Files.isRegularFile(file)
 }

@@ -1,28 +1,150 @@
 package pro.cslauncher.core.launch
 
 import kotlinx.serialization.Serializable
-import pro.cslauncher.core.account.LaunchSession
-import pro.cslauncher.core.component.InstalledComponent
-import pro.cslauncher.core.component.LwjglCompat
-import pro.cslauncher.core.install.*
+import pro.cslauncher.core.meta.ArgumentEntry
 import pro.cslauncher.core.meta.LaunchFeatures
+import pro.cslauncher.core.meta.Rule
 import pro.cslauncher.core.platform.PlatformInfo
-import pro.cslauncher.core.profile.JvmArgs
-import pro.cslauncher.core.profile.Profile
-import pro.cslauncher.core.renderer.RendererConfig
-import pro.cslauncher.core.runtime.JavaRuntime
-import pro.cslauncher.core.util.Redactor
-import java.io.File
-import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.Paths
 
 /**
- * Immutable, serialisable launch configuration. Created once per launch; profile edits during startup do not
- * affect it. The access token is NOT stored: [TOKEN_PLACEHOLDER] is substituted in memory via [withSecret].
+ * Expands Mojang's argument templates.
+ *
+ * Two generations exist: the pre-1.13 `minecraftArguments` string (no rules) and the 1.13+
+ * `arguments` object with `game`/`jvm` lists whose entries carry rules and `${placeholders}`. Both are
+ * supported, and a placeholder that cannot be resolved is reported instead of being passed through
+ * literally — `${auth_player_name}` appearing in a chat message is a support ticket nobody can solve.
+ */
+object ArgumentBuilder {
+
+    // "}" is escaped: Android's ICU regex rejects a bare "}".
+    private val PLACEHOLDER = Regex("""\$\{([A-Za-z0-9_.]+)\}""")
+
+    fun substitute(s: String, values: Map<String, String>, unresolved: MutableSet<String>): String =
+        PLACEHOLDER.replace(s) { m ->
+            values[m.groupValues[1]] ?: run {
+                unresolved += m.groupValues[1]
+                m.value
+            }
+        }
+
+    /** Expands modern argument entries, honouring rules and feature flags. */
+    fun expand(entries: List<ArgumentEntry>, platform: PlatformInfo, features: LaunchFeatures): List<String> =
+        entries.filter { Rule.allows(it.rules, platform, features) }.flatMap { it.values }
+
+    /** Pre-1.13 `minecraftArguments`. Mojang never puts spaces inside a value here. */
+    fun legacy(minecraftArguments: String): List<String> =
+        minecraftArguments.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+
+    fun expandLegacy(minecraftArguments: String, platform: PlatformInfo, features: LaunchFeatures): List<String> =
+        ArgumentBuilder.expand(
+            listOf(ArgumentEntry(legacy(minecraftArguments), emptyList())), platform, features
+        )
+
+    /**
+     * Replaces `${auth_access_token}` and any other secret-ish placeholder with a marker before the
+     * command line is written to disk. A token in a log file is a credential leak.
+     */
+    fun redactRedactedCommand(args: List<String>): List<String> {
+        val out = ArrayList<String>(args.size)
+        var i = 0
+        while (i < args.size) {
+            val a = args[i]
+            if (SECRET_FLAG.matches(a)) {
+                // The value is the next token: redact it too, not just the flag.
+                out += a
+                if (i + 1 < args.size) {
+                    out += "<redacted>"
+                    i += 2
+                    continue
+                }
+            } else if (SECRET_ARG.containsMatchIn(a)) {
+                out += SECRET_ARG.replace(a) { m ->
+                    m.groupValues[1] + (m.groupValues[2].takeIf { it.isNotEmpty() } ?: "=") + "<redacted>"
+                }
+            } else {
+                out += a
+            }
+            i++
+        }
+        return out
+    }
+
+    /**
+     * Matches a credential flag and its value in either form the game accepts: a separate token
+     * (`--accessToken TOKEN`) or an inline one (`--accessToken=TOKEN`).
+     */
+    private val SECRET_FLAG = Regex("(?i)--(accessToken|clientid|xuid|auth_session|session)")
+
+    private val SECRET_ARG = Regex(
+        "(?i)(--accessToken|--clientid|--xuid|--auth_session|--session|auth_access_token=|accessToken=)(\\s+|=)?[^\\s]+"
+    )
+}
+
+/**
+ * `JNI_CreateJavaVM` accepts single-token options only. This converts launcher-style arguments —
+ * where `-cp` and `--add-opens` take a separate token — into the joined form the JNI interface needs.
+ * Only used by the Android in-process launcher; desktop launches pass arguments through unchanged.
+ */
+object JvmOptionNormalizer {
+
+    data class Result(val options: List<String>, val dropped: List<String>)
+
+    private val TWO_TOKEN = setOf(
+        "--add-opens", "--add-exports", "--add-reads", "--add-modules",
+        "--patch-module", "--limit-modules", "--module-path", "-p"
+    )
+
+    fun normalize(args: List<String>): Result {
+        val out = mutableListOf<String>()
+        val dropped = mutableListOf<String>()
+        var i = 0
+        while (i < args.size) {
+            val a = args[i]
+            when {
+                a == "-cp" || a == "-classpath" || a == "--class-path" -> {
+                    out += "-Djava.class.path=" + args.getOrElse(i + 1) { "" }
+                    i += 2
+                }
+                a in TWO_TOKEN -> {
+                    val v = args.getOrElse(i + 1) { "" }
+                    val key = if (a == "-p") "--module-path" else a
+                    out += if (key == "--module-path") "-Djdk.module.path=$v" else "$key=$v"
+                    i += 2
+                }
+                // macOS-only: the JVM would refuse to start a main thread that does not exist here.
+                a == "-XstartOnFirstThread" -> {
+                    dropped += a
+                    i++
+                }
+                // Windows-only workaround that some launchers copy into their default arguments.
+                a.startsWith("-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance") -> {
+                    dropped += a
+                    i++
+                }
+                a.isBlank() -> i++
+                else -> {
+                    out += a
+                    i++
+                }
+            }
+        }
+        return Result(out, dropped)
+    }
+}
+
+/**
+ * The complete, serialisable instructions for one launch.
+ *
+ * The plan is written to the session directory before the game starts, which is what makes the
+ * launcher debuggable: a crash report can be matched against the exact command line, classpath,
+ * renderer and environment that produced it. It is the contract between the core and the native
+ * launcher, so keep it backward compatible (`planVersion`).
  */
 @Serializable
 data class LaunchPlan(
-    val planVersion: Int = 1,
+    val planVersion: Int = 2,
     val profileId: String,
     val profileName: String,
     val versionId: String,
@@ -45,141 +167,35 @@ data class LaunchPlan(
     val logFile: String,
     val width: Int,
     val height: Int,
-    val createdAtMs: Long = System.currentTimeMillis(),
+    /** Additions over the original plan format; all optional so an older reader still works. */
+    val preloadLibraries: List<String> = emptyList(),
+    val fullAccessTokenPresent: Boolean = false,
+    val createdAtMs: Long = System.currentTimeMillis()
 ) {
-    companion object { const val TOKEN_PLACEHOLDER = "@@CS_ACCESS_TOKEN@@" }
-    fun withSecret(accessToken: String) = copy(gameArgs = gameArgs.map { it.replace(TOKEN_PLACEHOLDER, accessToken) })
-    fun redactedCommandLine(): String = (listOf(javaExecutable) + Redactor.redactArgs(jvmArgs) + mainClass + Redactor.redactArgs(gameArgs)).joinToString(" ")
-}
+    /** The full argument vector, useful for a desktop launch and for diagnostics. */
+    fun commandLine(): List<String> = listOf(javaExecutable) + jvmArgs + listOf(mainClass) + gameArgs
 
-data class LaunchInput(
-    val profile: Profile,
-    val resolved: ResolvedVersion,
-    val runtime: JavaRuntime,
-    val session: LaunchSession,
-    val renderer: RendererConfig,
-    val memoryMb: Int,
-    val width: Int,
-    val height: Int,
-    val sessionDir: Path,
-    val lwjglComponent: InstalledComponent? = null, // Android: LWJGL jars + natives built for bionic
-    val glfwShim: Path? = null,                     // Android: libcsglfw.so from the APK
-    val launcherVersion: String = "1.0.0",
-)
+    /** Same vector with secrets removed — the only version that may be logged or shown. */
+    fun redactedCommandLine(): String = ArgumentBuilder.redactRedactedCommand(commandLine()).joinToString(" ")
+
+    fun validate(): List<String> {
+        val out = mutableListOf<String>()
+        if (mainClass.isBlank()) out += "No main class"
+        if (javaHome.isBlank()) out += "No Java home"
+        if (classpath.isEmpty()) out += "Empty classpath"
+        classpath.filterNot { Paths.get(it).isAbsolute }.forEach { out += "Classpath entry is not absolute: $it" }
+        if (workingDir.isBlank()) out += "No working directory"
+        if (width <= 0 || height <= 0) out += "Invalid window size ${width}x$height"
+        // A non-absolute native directory is invisible to the dynamic linker: fail loudly instead.
+        nativeDirs.filterNot { Paths.get(it).isAbsolute }.forEach { out += "Native directory is not absolute: $it" }
+        return out
+    }
+
+    fun nativePaths(): List<Path> = nativeDirs.map { Paths.get(it) }
+
+    /** Reads a stored plan back (diagnostics, or resuming a launch the UI recreated). */
+    fun fromJson(text: String): LaunchPlan =
+        pro.cslauncher.core.util.CsJson.decodeFromString(serializer(), text)
+}
 
 class LaunchPlanException(message: String) : Exception(message)
-
-class LaunchPlanner(private val dirs: LauncherDirs, private val platform: PlatformInfo) {
-
-    fun plan(input: LaunchInput): LaunchPlan {
-        val rv = input.resolved; val meta = rv.meta; val p = input.profile
-        val gameDir = p.gameDir(dirs)
-        val nativesDir: Path = if (platform.isAndroid) input.lwjglComponent?.libDir ?: throw LaunchPlanException("LWJGL Android component is not installed")
-                               else dirs.nativesDir(meta.id)
-
-        // ---- classpath: metadata order, Android LWJGL substitution, client jar last ----
-        val cp = LinkedHashMap<String, Path>()
-        val lwjglJars = input.lwjglComponent?.jars().orEmpty()
-        for (rl in rv.libraries.filter { it.onClasspath }) {
-            val c = rl.library.coordinate
-            if (platform.isAndroid && c.group == "org.lwjgl") continue
-            cp.putIfAbsent(c.versionlessKey, rl.file)
-        }
-        if (platform.isAndroid) lwjglJars.forEach { cp.putIfAbsent("component:" + it.fileName, it) }
-        cp["client"] = dirs.versionJar(rv.jarVersionId)
-        val classpath = cp.values.map { it.toAbsolutePath().toString() }
-
-        val features = LaunchFeatures(hasCustomResolution = input.width > 0 && input.height > 0)
-        val assetIndexId = meta.assetIndex?.id ?: meta.assets ?: "legacy"
-        val legacyAssets = dirs.assets.resolve("virtual").resolve(assetIndexId)
-        val values = mapOf(
-            "auth_player_name" to input.session.username,
-            "auth_uuid" to input.session.uuid,
-            "auth_access_token" to (if (input.session.isOffline) input.session.accessToken else LaunchPlan.TOKEN_PLACEHOLDER),
-            "auth_session" to (if (input.session.isOffline) input.session.accessToken else "token:${LaunchPlan.TOKEN_PLACEHOLDER}:${input.session.uuid}"),
-            "auth_xuid" to input.session.xuid,
-            "clientid" to input.session.clientId,
-            "user_type" to input.session.userType,
-            "user_properties" to "{}",
-            "version_name" to meta.id,
-            "version_type" to meta.type.id.replace("modded", "release"),
-            "game_directory" to gameDir.toAbsolutePath().toString(),
-            "assets_root" to dirs.assets.toAbsolutePath().toString(),
-            "game_assets" to (if (Files.isDirectory(legacyAssets)) legacyAssets else dirs.assets).toAbsolutePath().toString(),
-            "assets_index_name" to assetIndexId,
-            "resolution_width" to input.width.toString(),
-            "resolution_height" to input.height.toString(),
-            "natives_directory" to nativesDir.toAbsolutePath().toString(),
-            "launcher_name" to "cslauncherpro",
-            "launcher_version" to input.launcherVersion,
-            "classpath" to classpath.joinToString(File.pathSeparator),
-            "classpath_separator" to File.pathSeparator,
-            "library_directory" to dirs.libraries.toAbsolutePath().toString(),
-            "path" to (meta.logging?.let { dirs.logConfigs.resolve(it.fileId).toAbsolutePath().toString() } ?: ""),
-        )
-        val unresolved = linkedSetOf<String>()
-        fun sub(s: String) = ArgumentBuilder.substitute(s, values, unresolved)
-
-        // ---- JVM arguments ----
-        val jvm = mutableListOf<String>()
-        jvm += "-Xms${minOf(512, input.memoryMb)}m"; jvm += "-Xmx${input.memoryMb}m"
-        if (meta.jvmArguments.isNotEmpty()) jvm += ArgumentBuilder.expand(meta.jvmArguments, platform, features).map(::sub)
-        else { jvm += "-Djava.library.path=${values["natives_directory"]}"; jvm += "-cp"; jvm += values.getValue("classpath") }
-        meta.logging?.let { lg -> if (Files.isRegularFile(dirs.logConfigs.resolve(lg.fileId))) jvm += sub(lg.argument) }
-        jvm += "-Dminecraft.launcher.brand=cslauncherpro"
-        jvm += "-Dminecraft.launcher.version=${input.launcherVersion}"
-        jvm += "-Dlog4j2.formatMsgNoLookups=true"
-        jvm += "-Djava.io.tmpdir=${input.sessionDir.resolve("tmp").toAbsolutePath()}"
-        if (jvm.none { it.startsWith("-Dfile.encoding") }) jvm += "-Dfile.encoding=UTF-8"
-        if (platform.isAndroid) {
-            jvm += "-Dorg.lwjgl.librarypath=${nativesDir.toAbsolutePath()}"
-            val shim = input.glfwShim ?: throw LaunchPlanException("GLFW integration library missing from the APK")
-            jvm += "-Dorg.lwjgl.glfw.libname=${shim.toAbsolutePath()}"
-            jvm += "-Dorg.lwjgl.util.NoChecks=true"
-            jvm += "-Djava.awt.headless=true"
-            val lw = input.lwjglComponent?.lwjglVersion
-            if (lw != null && LwjglCompat.majorMinor(lw) >= LwjglCompat.majorMinor(LwjglCompat.SDL_BRIDGE_MIN)) {
-                // LWJGL 3.4 (Minecraft 26.x). SDL3 calls go to the launcher's bridge inside libcsglfw.so; the shader
-                // toolchain the 26.3 OpenGL backend uses (GLSL -> shaderc -> SPIR-V -> SPIRV-Cross -> GLSL) comes from
-                // the component. Vulkan is not offered (the bridge renders through EGL): pointing LWJGL at a library
-                // that does not exist makes VK.create() fail, which Minecraft handles by staying on OpenGL.
-                jvm += "-Dorg.lwjgl.sdl.libname=${shim.toAbsolutePath()}"
-                jvm += "-Dorg.lwjgl.shaderc.libname=${nativesDir.resolve("libshaderc.so").toAbsolutePath()}"
-                jvm += "-Dorg.lwjgl.spvc.libname=${nativesDir.resolve("libspirv-cross.so").toAbsolutePath()}"
-                jvm += "-Dorg.lwjgl.vulkan.libname=${nativesDir.resolve("vulkan-not-available.so").toAbsolutePath()}"
-            }
-        }
-        input.renderer.jvmProps.forEach { (k, v) -> jvm += "-D$k=$v" }
-        val userJvm = JvmArgs.tokenize(p.jvmArgs)
-        val errors = JvmArgs.validate(userJvm).filter { it.severity == JvmArgs.Severity.ERROR }
-        if (errors.isNotEmpty()) throw LaunchPlanException("Invalid JVM arguments: " + errors.joinToString { "${it.arg} (${it.message})" })
-        jvm += userJvm
-
-        // ---- game arguments ----
-        val game = mutableListOf<String>()
-        game += if (meta.usesModernArguments && meta.gameArguments.isNotEmpty()) ArgumentBuilder.expand(meta.gameArguments, platform, features).map(::sub)
-                else ArgumentBuilder.legacy(meta.legacyArguments ?: throw LaunchPlanException("Version ${meta.id} defines no game arguments")).map(::sub)
-        if (features.hasCustomResolution && meta.gameArguments.isEmpty()) game += listOf("--width", input.width.toString(), "--height", input.height.toString())
-        if (p.fullscreen && "--fullscreen" !in game) game += "--fullscreen"
-        game += JvmArgs.tokenize(p.gameArgs)
-
-        if (unresolved.isNotEmpty()) throw LaunchPlanException("Unresolved launch placeholders: ${unresolved.joinToString()}")
-
-        val env = LinkedHashMap<String, String>()
-        env.putAll(input.renderer.env.filterValues { it.isNotEmpty() })
-        env.putAll(p.env)
-        val logFile = input.sessionDir.resolve("game-output.log")
-        return LaunchPlan(
-            profileId = p.id, profileName = p.name, versionId = meta.id, mainClass = meta.mainClass,
-            javaHome = input.runtime.home.toAbsolutePath().toString(), javaMajor = input.runtime.major,
-            javaExecutable = input.runtime.javaExecutable.toAbsolutePath().toString(), libjvm = input.runtime.libjvm()?.toAbsolutePath()?.toString(),
-            classpath = classpath, nativeDirs = listOf(nativesDir.toAbsolutePath().toString()), jvmArgs = jvm, gameArgs = game,
-            workingDir = gameDir.toAbsolutePath().toString(), env = env,
-            rendererId = input.renderer.rendererId, rendererContext = input.renderer.contextKind.name,
-            rendererLibraries = listOfNotNull(input.renderer.glLibrary?.let { "gl" to it }, input.renderer.eglLibrary?.let { "egl" to it },
-                input.renderer.osmesaLibrary?.let { "osmesa" to it }).associate { it.first to it.second.toAbsolutePath().toString() },
-            controlLayoutId = p.controlLayoutId, sessionDir = input.sessionDir.toAbsolutePath().toString(), logFile = logFile.toAbsolutePath().toString(),
-            width = input.width, height = input.height,
-        )
-    }
-}

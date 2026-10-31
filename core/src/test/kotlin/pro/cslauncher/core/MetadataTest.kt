@@ -1,108 +1,177 @@
 package pro.cslauncher.core
 
-import pro.cslauncher.core.meta.*
-import pro.cslauncher.core.platform.PlatformInfo
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import pro.cslauncher.core.launch.ArgumentBuilder
+import pro.cslauncher.core.meta.AssetIndex
+import pro.cslauncher.core.meta.LaunchFeatures
+import pro.cslauncher.core.meta.NativeClassifier
+import pro.cslauncher.core.meta.Rule
+import pro.cslauncher.core.meta.VersionManifest
+import pro.cslauncher.core.meta.VersionMetadata
+import java.time.Instant
 import pro.cslauncher.core.util.MetadataException
-import kotlin.test.*
+import pro.cslauncher.core.util.parseJsonArray
 
 class MetadataTest {
-    private val linux64 = PlatformInfo("linux", PlatformInfo.Arch.X86_64, "6.1", false)
-    private val android = PlatformInfo.android("arm64-v8a", "14")
 
-    val modern = """{"id":"1.20.1","type":"release","mainClass":"net.minecraft.client.main.Main","javaVersion":{"component":"java-runtime-gamma","majorVersion":17},
-      "assetIndex":{"id":"5","sha1":"aa","size":10,"totalSize":100,"url":"https://x/5.json"},"assets":"5",
-      "downloads":{"client":{"sha1":"cc","size":20,"url":"https://x/client.jar"}},
-      "arguments":{"game":["--username","${'$'}{auth_player_name}",{"rules":[{"action":"allow","features":{"has_custom_resolution":true}}],"value":["--width","${'$'}{resolution_width}"]}],
-                   "jvm":[{"rules":[{"action":"allow","os":{"name":"osx"}}],"value":["-XstartOnFirstThread"]},{"rules":[{"action":"allow","os":{"arch":"x86"}}],"value":"-Xss1M"},"-Djava.library.path=${'$'}{natives_directory}","-cp","${'$'}{classpath}"]},
-      "libraries":[
-        {"name":"com.mojang:brigadier:1.1.8","downloads":{"artifact":{"path":"com/mojang/brigadier/1.1.8/brigadier-1.1.8.jar","sha1":"b1","size":5,"url":"https://l/b.jar"}}},
-        {"name":"org.lwjgl:lwjgl:3.3.1","downloads":{"artifact":{"path":"org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar","sha1":"l1","size":5,"url":"https://l/l.jar"}}},
-        {"name":"org.lwjgl:lwjgl:3.3.1:natives-linux","downloads":{"artifact":{"path":"org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-linux.jar","sha1":"n1","size":5,"url":"https://l/n.jar"}},"rules":[{"action":"allow","os":{"name":"linux"}}]},
-        {"name":"org.lwjgl:lwjgl:3.3.1:natives-windows","downloads":{"artifact":{"path":"w.jar","sha1":"w","size":5,"url":"https://l/w.jar"}},"rules":[{"action":"allow","os":{"name":"windows"}}]},
-        {"name":"ca.weblite:java-objc-bridge:1.1","downloads":{"artifact":{"path":"o.jar","sha1":"o","size":5,"url":"https://l/o.jar"}},"rules":[{"action":"allow","os":{"name":"osx"}}]}
-      ],"logging":{"client":{"argument":"-Dlog4j.configurationFile=${'$'}{path}","file":{"id":"client-1.12.xml","sha1":"f","size":3,"url":"https://x/log.xml"},"type":"log4j2-xml"}}}"""
+    private val modern = """
+    {
+      "id": "1.20.1", "type": "release", "mainClass": "net.minecraft.client.main.Main",
+      "javaVersion": { "component": "java", "majorVersion": 17 },
+      "assets": "5", "assetIndex": { "id": "5", "url": "https://example.invalid/5.json", "sha1": "abc", "size": 10 },
+      "downloads": { "client": { "url": "https://example.invalid/client.jar", "sha1": "cc", "size": 100 } },
+      "arguments": {
+        "game": [
+          { "rules": [{ "action": "allow", "features": { "has_custom_resolution": true } }],
+            "value": ["--width", "${'$'}{resolution_width}", "--height", "${'$'}{resolution_height}"] },
+          "--username", "${'$'}{auth_player_name}"
+        ],
+        "jvm": ["-Djava.library.path=${'$'}{natives_directory}", "-Djava.class.path=${'$'}{classpath}"]
+      },
+      "libraries": [
+        { "name": "com.example:plain:1.0", "downloads": { "artifact": { "url": "https://example.invalid/plain.jar", "path": "com/example/plain/1.0/plain-1.0.jar" } } },
+        { "name": "org.lwjgl:lwjgl:3.3.1",
+          "natives": { "linux": "natives-linux-${'$'}{arch}" },
+          "downloads": {
+            "artifact": { "url": "https://example.invalid/lwjgl.jar", "path": "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1.jar" },
+            "classifiers": { "natives-linux": { "url": "https://example.invalid/lwjgl-natives-arm64.jar", "path": "org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-linux-arm64.jar" } } } },
+        { "name": "com.windows:only:1.0",
+          "rules": [{ "action": "allow", "os": { "name": "windows" } }],
+          "downloads": { "artifact": { "url": "https://example.invalid/win.jar", "path": "win.jar" } } }
+      ]
+    }
+    """.trimIndent()
 
-    val legacy = """{"id":"1.8.9","type":"release","mainClass":"net.minecraft.client.main.Main","minecraftArguments":"--username ${'$'}{auth_player_name} --version ${'$'}{version_name} --gameDir ${'$'}{game_directory} --assetsDir ${'$'}{assets_root} --assetIndex ${'$'}{assets_index_name} --uuid ${'$'}{auth_uuid} --accessToken ${'$'}{auth_access_token} --userProperties ${'$'}{user_properties} --userType ${'$'}{user_type}",
-      "assetIndex":{"id":"1.8","url":"https://x/1.8.json"},"downloads":{"client":{"url":"https://x/c.jar","sha1":"c"}},
-      "libraries":[{"name":"org.lwjgl.lwjgl:lwjgl-platform:2.9.4","natives":{"linux":"natives-linux","windows":"natives-windows-${'$'}{arch}"},"extract":{"exclude":["META-INF/"]},
-        "downloads":{"classifiers":{"natives-linux":{"path":"p/linux.jar","url":"https://l/linux.jar","sha1":"x"},"natives-windows-64":{"path":"p/w64.jar","url":"https://l/w64.jar","sha1":"y"}}}},
-        {"name":"org.lwjgl.lwjgl:lwjgl:2.9.4","rules":[{"action":"allow"},{"action":"disallow","os":{"name":"osx"}}],"downloads":{"artifact":{"path":"p/lwjgl.jar","url":"https://l/lwjgl.jar","sha1":"z"}}}]}"""
-
-    @Test fun parsesModernMetadata() {
-        val m = VersionMetadata.parse(modern)
-        assertEquals("1.20.1", m.id); assertEquals(17, m.javaMajor); assertTrue(m.usesModernArguments); assertTrue(m.usesLwjgl3)
-        assertEquals("5", m.assetIndex!!.id); assertEquals(5, m.libraries.size); assertEquals("client-1.12.xml", m.logging!!.fileId)
+    @Test
+    fun parsesModernMetadata() {
+        val meta = VersionMetadata.parse(modern)
+        assertEquals("1.20.1", meta.id)
+        assertEquals(17, meta.javaMajor)
+        assertTrue(meta.usesModernArguments)
+        assertTrue(meta.usesLwjgl3)
+        assertFalse(meta.usesSdl)
+        assertEquals("5", meta.assetIndex?.id)
+        assertEquals(3, meta.libraries.size)
+        assertEquals("net.minecraft.client.main.Main", meta.mainClass)
     }
 
-    @Test fun parsesLegacyMetadata() {
-        val m = VersionMetadata.parse(legacy)
-        assertFalse(m.usesModernArguments); assertFalse(m.usesLwjgl3); assertNotNull(m.legacyArguments)
-        assertEquals("natives-windows-\${arch}", m.libraries[0].natives["windows"])
+    @Test
+    fun rulesExcludeWindowsOnlyLibraryOnAndroid() {
+        val meta = VersionMetadata.parse(modern)
+        val android = TestWorld.platform(android = true)
+        val windowsOnly = meta.libraries.first { it.name.startsWith("com.windows") }
+        assertFalse(Rule.allows(windowsOnly.rules, android, LaunchFeatures()))
     }
 
-    @Test fun rejectsMalformedMetadata() {
-        assertFailsWith<MetadataException> { VersionMetadata.parse("{\"type\":\"release\"}") }
-        assertFailsWith<MetadataException> { VersionMetadata.parse("not json") }
-        assertFailsWith<MetadataException> { VersionMetadata.parse("""{"id":"x","mainClass":"a","libraries":[{"name":"../evil:x:1"}]}""") }
+    @Test
+    fun ruleAllowLaterWins() {
+        val rules = Rule.parseList(
+            parseJsonArray(
+                """
+                [{ "action": "allow" },
+                 { "action": "disallow", "os": { "name": "osx" } }]
+                """.trimIndent(), "rules"
+            )
+        )
+        assertTrue(Rule.allows(rules, TestWorld.platform(android = true), LaunchFeatures()))
     }
 
-    @Test fun rulesEvaluateOsArchAndFeatures() {
-        val osxOnly = listOf(Rule(true, "osx", null, null, emptyMap()))
-        assertFalse(RuleEvaluator.allowed(osxOnly, linux64))
-        val allowButNotOsx = listOf(Rule(true, null, null, null, emptyMap()), Rule(false, "osx", null, null, emptyMap()))
-        assertTrue(RuleEvaluator.allowed(allowButNotOsx, linux64))
-        assertFalse(RuleEvaluator.allowed(listOf(Rule(true, null, null, "x86", emptyMap())), linux64))
-        val feat = listOf(Rule(true, null, null, null, mapOf("has_custom_resolution" to true)))
-        assertFalse(RuleEvaluator.allowed(feat, linux64, LaunchFeatures()))
-        assertTrue(RuleEvaluator.allowed(feat, linux64, LaunchFeatures(hasCustomResolution = true)))
-        assertTrue(RuleEvaluator.allowed(emptyList(), linux64))
+    @Test
+    fun featureRulesOnlyApplyWhenFeatureEnabled() {
+        val meta = VersionMetadata.parse(modern)
+        val android = TestWorld.platform(android = true)
+        val without = ArgumentBuilder.expand(meta.gameArguments, android, LaunchFeatures())
+        assertFalse(without.contains("--width"))
+        val with = ArgumentBuilder.expand(meta.gameArguments, android, LaunchFeatures(hasCustomResolution = true))
+        assertTrue(with.contains("--width"))
     }
 
-    @Test fun mavenCoordinates() {
-        assertEquals("net/fabricmc/fabric-loader/0.15.0/fabric-loader-0.15.0.jar", MavenCoordinate.parse("net.fabricmc:fabric-loader:0.15.0").path())
-        assertEquals("org/lwjgl/lwjgl/3.3.1/lwjgl-3.3.1-natives-linux.jar", MavenCoordinate.parse("org.lwjgl:lwjgl:3.3.1:natives-linux").path())
-        assertEquals("a/b/c/1/c-1.zip", MavenCoordinate.parse("a.b:c:1@zip").path())
+    @Test
+    fun nativeClassifierTriesPlatformVariants() {
+        val meta = VersionMetadata.parse(modern)
+        val lwjgl = meta.libraries.first { it.name.startsWith("org.lwjgl") }
+        val candidates = NativeClassifier.candidates(lwjgl.natives.getValue("linux"), TestWorld.platform(android = true))
+        assertTrue(candidates.contains("natives-linux-arm64"))
+        assertTrue(candidates.first().startsWith("natives-linux"))
     }
 
-    @Test fun mergesInheritedLoaderProfile() {
+    @Test
+    fun mergeChildOverridesParentButKeepsLibraries() {
+        val child = VersionMetadata.parse(
+            """
+            { "id": "fabric-loader-0.15.7-1.20.1", "inheritsFrom": "1.20.1",
+              "libraries": [ { "name": "net.fabricmc:fabric-loader:0.15.7",
+                "downloads": { "artifact": { "url": "https://example.invalid/fl.jar", "path": "fl.jar" } } } ] }
+            """.trimIndent()
+        )
         val parent = VersionMetadata.parse(modern)
-        val child = VersionMetadata.parse("""{"id":"fabric-loader-0.15.0-1.20.1","inheritsFrom":"1.20.1","mainClass":"net.fabricmc.loader.impl.launch.knot.KnotClient",
-           "arguments":{"game":[],"jvm":["-DFabricMcEmu= net.minecraft.client.main.Main "]},
-           "libraries":[{"name":"net.fabricmc:fabric-loader:0.15.0","url":"https://maven.fabricmc.net/"},{"name":"com.mojang:brigadier:1.2.0","url":"https://maven.fabricmc.net/"}]}""")
-        val m = VersionMetadata.merge(child, parent)
-        assertEquals("net.fabricmc.loader.impl.launch.knot.KnotClient", m.mainClass)
-        assertEquals(17, m.javaMajor)
-        assertEquals("https://maven.fabricmc.net/net/fabricmc/fabric-loader/0.15.0/fabric-loader-0.15.0.jar", m.libraries[0].artifact!!.url)
-        assertEquals(1, m.libraries.count { it.coordinate.artifact == "brigadier" }, "child library overrides parent version")
-        assertEquals("1.2.0", m.libraries.first { it.coordinate.artifact == "brigadier" }.coordinate.version)
-        assertTrue(m.jvmArguments.size == parent.jvmArguments.size + 1)
+        val merged = VersionMetadata.merge(child, parent)
+        assertEquals("fabric-loader-0.15.7-1.20.1", merged.id)
+        // The loader profile has no main class of its own: the parent's must survive the merge.
+        assertEquals("net.minecraft.client.main.Main", merged.mainClass)
+        assertTrue(merged.libraries.any { it.name.startsWith("net.fabricmc") })
+        assertTrue(merged.libraries.any { it.name.startsWith("org.lwjgl") })
     }
 
-    @Test fun assetIndexValidation() {
-        val idx = AssetIndex.parse("""{"objects":{"minecraft/sounds/a.ogg":{"hash":"0123456789abcdef0123456789abcdef01234567","size":5}}}""")
-        assertEquals("01/0123456789abcdef0123456789abcdef01234567", idx.objects[0].relativeObjectPath)
-        assertFailsWith<MetadataException> { AssetIndex.parse("""{"objects":{"../x":{"hash":"0123456789abcdef0123456789abcdef01234567","size":5}}}""") }
-        assertFailsWith<MetadataException> { AssetIndex.parse("""{"objects":{"x":{"hash":"zz","size":5}}}""") }
+    @Test
+    fun legacyArgumentsAreSupported() {
+        val legacy = """
+        { "id": "1.8.9", "mainClass": "net.minecraft.client.main.Main",
+          "minecraftArguments": "--username ${'$'}{auth_player_name} --version ${'$'}{version_name}",
+          "libraries": [] }
+        """.trimIndent()
+        val meta = VersionMetadata.parse(legacy)
+        assertFalse(meta.usesModernArguments)
+        assertEquals("--username ${'$'}{auth_player_name} --version ${'$'}{version_name}", meta.legacyArguments)
+        assertFalse(meta.usesLwjgl3)
     }
 
-    @Test fun manifestParsingAndFiltering() {
-        val m = VersionManifest.parse("""{"latest":{"release":"1.21","snapshot":"24w01a"},"versions":[{"id":"24w01a","type":"snapshot","url":"u1","releaseTime":"2024"},{"id":"1.21","type":"release","url":"u2","sha1":"s","releaseTime":"2024"},{"id":"b1.7.3","type":"old_beta","url":"u3","releaseTime":"2011"}]}""", java.time.Instant.now(), false)
-        assertEquals(listOf("1.21"), m.filter(setOf(VersionType.RELEASE)).map { it.id })
-        assertEquals(2, m.filter(setOf(VersionType.RELEASE, VersionType.SNAPSHOT)).size)
-        assertEquals(listOf("b1.7.3"), m.filter(VersionType.entries.toSet(), "b1").map { it.id })
+    @Test
+    fun rejectsMalformedMetadata() {
+        val bad = listOf(
+            "{",
+            """{ "id": "", "mainClass": "x" }""",
+            """{ "id": "x", "libraries": "nope" }"""
+        )
+        for (text in bad) {
+            try {
+                VersionMetadata.parse(text)
+                throw AssertionError("Should have rejected: $text")
+            } catch (_: MetadataException) {
+            }
+        }
     }
 
-    @Test fun androidPlatformExcludesDesktopNatives() {
-        val dirs = pro.cslauncher.core.install.LauncherDirs(tempDir())
-        val http = pro.cslauncher.core.net.UrlConnectionTransport()
-        val desk = pro.cslauncher.core.install.Installer(dirs, http, pro.cslauncher.core.download.DownloadManager(http), linux64)
-            .resolveLibraries(VersionMetadata.parse(modern), listOf("1.20.1"), "1.20.1")
-        assertTrue(desk.libraries.any { it.isNative }); assertTrue(desk.skippedByRules.any { it.contains("windows") }); assertTrue(desk.skippedByRules.any { it.contains("objc") })
-        val andr = pro.cslauncher.core.install.Installer(dirs, http, pro.cslauncher.core.download.DownloadManager(http), android)
-            .resolveLibraries(VersionMetadata.parse(modern), listOf("1.20.1"), "1.20.1")
-        assertTrue(andr.libraries.none { it.isNative }); assertEquals(listOf("org.lwjgl:lwjgl:3.3.1:natives-linux"), andr.desktopNativesReplaced)
-        val legacyRv = pro.cslauncher.core.install.Installer(dirs, http, pro.cslauncher.core.download.DownloadManager(http), linux64)
-            .resolveLibraries(VersionMetadata.parse(legacy), listOf("1.8.9"), "1.8.9")
-        assertTrue(legacyRv.libraries.any { it.isNative && it.file.toString().endsWith("p/linux.jar") })
+    @Test
+    fun assetIndexIsDeduplicated() {
+        val json = """
+        { "objects": {
+            "a/one": { "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 1 },
+            "b/same": { "hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "size": 1 },
+            "c/two": { "hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "size": 2 }
+        } }
+        """.trimIndent()
+        val index = AssetIndex.parse(json)
+        assertEquals(3, index.objects.size)
+        assertEquals(2, index.uniqueObjects().size)
+        assertEquals("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", index.objects.first { it.name == "b/same" }.hash)
+    }
+
+    @Test
+    fun manifestFindsVersion() {
+        val manifest = VersionManifest.parse(
+            """
+            { "latest": { "release": "1.20.1", "snapshot": "24w01a" },
+              "versions": [ { "id": "1.20.1", "type": "release", "url": "https://example.invalid/1.20.1.json", "sha1": "x", "releaseTime": "2023-06-12T00:00:00Z" } ] }
+            """.trimIndent(),
+            Instant.now(), fromCache = false
+        )
+        assertNotNull(manifest.find("1.20.1"))
+        assertEquals(null, manifest.find("1.21"))
+        assertEquals("1.20.1", manifest.latestRelease)
     }
 }

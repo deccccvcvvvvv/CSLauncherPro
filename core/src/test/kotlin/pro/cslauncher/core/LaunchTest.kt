@@ -1,171 +1,204 @@
 package pro.cslauncher.core
 
-import kotlinx.coroutines.test.runTest
-import pro.cslauncher.core.account.*
-import pro.cslauncher.core.component.*
-import pro.cslauncher.core.download.DownloadManager
-import pro.cslauncher.core.install.*
-import pro.cslauncher.core.launch.*
-import pro.cslauncher.core.meta.VersionMetadata
-import pro.cslauncher.core.net.UrlConnectionTransport
-import pro.cslauncher.core.perf.DeviceFacts
-import pro.cslauncher.core.platform.PlatformInfo
-import pro.cslauncher.core.profile.*
-import pro.cslauncher.core.renderer.*
-import pro.cslauncher.core.runtime.*
-import java.io.File
-import java.nio.file.Files
-import java.nio.file.Path
-import kotlin.test.*
+import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import pro.cslauncher.core.launch.AndroidRuntimeEnv
+import pro.cslauncher.core.launch.ArgumentBuilder
+import pro.cslauncher.core.launch.IllegalLaunchTransition
+import pro.cslauncher.core.launch.JvmOptionNormalizer
+import pro.cslauncher.core.launch.LaunchPlan
+import pro.cslauncher.core.launch.LaunchState
+import pro.cslauncher.core.launch.LaunchStateMachine
+import pro.cslauncher.core.launch.Log4jXml
+import pro.cslauncher.core.launch.Milestone
+import pro.cslauncher.core.launch.StartupMonitor
+import pro.cslauncher.core.meta.ArgumentEntry
+import pro.cslauncher.core.meta.LaunchFeatures
+import pro.cslauncher.core.meta.Rule
 
 class LaunchTest {
-    private val linux = PlatformInfo("linux", PlatformInfo.Arch.X86_64, "6.1", false)
-    private val android = PlatformInfo.android("arm64-v8a", "14")
-    private val http = UrlConnectionTransport()
 
-    private fun fakeRuntime(dir: Path, major: Int, arch: String = "x86_64", android: Boolean = false): JavaRuntime {
-        Files.createDirectories(dir.resolve("lib/server")); Files.writeString(dir.resolve("release"), "JAVA_VERSION=\"$major.0.1\"\nOS_ARCH=\"$arch\"\nIMPLEMENTOR=\"Test\"\n")
-        Files.write(dir.resolve("lib/server/libjvm.so"), ByteArray(4))
-        return RuntimeProbe.probe(dir, RuntimeSource.IMPORTED, android)!!
-    }
-
-    private val meta = VersionMetadata.parse(MetadataTest().modern)
-    private val offline = LaunchSession("Steve", "0123456789abcdef0123456789abcdef", "0", "legacy", "0", "0", true)
-    private val msa = LaunchSession("Alex", "fedcba9876543210fedcba9876543210", "SECRET-TOKEN-123", "msa", "2535", "cid", false)
-
-    @Test fun desktopPlanFromMetadata() {
-        val dirs = LauncherDirs(tempDir())
-        val rv = Installer(dirs, http, DownloadManager(http), linux).resolveLibraries(meta, listOf("1.20.1"), "1.20.1")
-        val rt = fakeRuntime(tempDir(), 17)
-        Files.createDirectories(dirs.logConfigs); Files.writeString(dirs.logConfigs.resolve("client-1.12.xml"), "<x/>")
-        val profile = Profile(name = "Test", versionId = "1.20.1", jvmArgs = "-XX:+UseG1GC")
-        val plan = LaunchPlanner(dirs, linux).plan(LaunchInput(profile, rv, rt, msa, SystemGlBackend().configure(env(linux), emptyMap()), 2048, 1280, 720, tempDir()))
-        assertEquals("net.minecraft.client.main.Main", plan.mainClass)
-        assertTrue("-Xmx2048m" in plan.jvmArgs); assertTrue("-XX:+UseG1GC" in plan.jvmArgs)
-        assertTrue(plan.jvmArgs.any { it.startsWith("-Dlog4j.configurationFile=") && it.endsWith("client-1.12.xml") })
-        assertFalse(plan.jvmArgs.contains("-XstartOnFirstThread"), "osx-only argument must be filtered")
-        assertFalse(plan.jvmArgs.contains("-Xss1M"), "x86-only argument must be filtered on x86_64")
-        val cp = plan.jvmArgs[plan.jvmArgs.indexOf("-cp") + 1].split(File.pathSeparator)
-        assertTrue(cp.last().endsWith("1.20.1.jar"), "client jar is last on the classpath")
-        assertTrue(cp.any { it.contains("brigadier") }); assertTrue(cp.none { it.contains("java-objc-bridge") })
-        assertEquals(listOf("--username", "Alex", "--width", "1280"), plan.gameArgs)
-        assertFalse(plan.toString().contains("SECRET-TOKEN-123"), "token never stored in the plan")
-        assertFalse(plan.redactedCommandLine().contains("SECRET"))
-    }
-
-    @Test fun legacyArgumentsAndTokenPlaceholder() {
-        val dirs = LauncherDirs(tempDir())
-        val lm = VersionMetadata.parse(MetadataTest().legacy)
-        val rv = Installer(dirs, http, DownloadManager(http), linux).resolveLibraries(lm, listOf("1.8.9"), "1.8.9")
-        val plan = LaunchPlanner(dirs, linux).plan(LaunchInput(Profile(name = "L", versionId = "1.8.9"), rv, fakeRuntime(tempDir(), 8), msa, SystemGlBackend().configure(env(linux), emptyMap()), 1024, 0, 0, tempDir()))
-        assertTrue(plan.jvmArgs.contains("-cp")); assertTrue(plan.jvmArgs.any { it.startsWith("-Djava.library.path=") })
-        val i = plan.gameArgs.indexOf("--accessToken"); assertEquals(LaunchPlan.TOKEN_PLACEHOLDER, plan.gameArgs[i + 1])
-        assertEquals("SECRET-TOKEN-123", plan.withSecret("SECRET-TOKEN-123").gameArgs[i + 1])
-        assertEquals("msa", plan.gameArgs[plan.gameArgs.indexOf("--userType") + 1])
-    }
-
-    @Test fun androidPlanSubstitutesLwjglAndAddsBridge() {
-        val dirs = LauncherDirs(tempDir())
-        val rv = Installer(dirs, http, DownloadManager(http), android).resolveLibraries(meta, listOf("1.20.1"), "1.20.1")
-        val compDir = tempDir(); Files.createDirectories(compDir.resolve("lib"))
-        val comp = InstalledComponent(ComponentManifest(1, "lwjgl-android", "LWJGL", "3.3.3", "lwjgl", "arm64-v8a", "BSD-3-Clause", "test", listOf("lwjgl:3.3.3"), listOf("jars/lwjgl.jar"), "lib", emptyList()), compDir)
-        val gl4es = tempDir().resolve("libgl4es.so").also { Files.write(it, ByteArray(1)) }
-        val renv = env(android, mapOf("libgl4es.so" to gl4es), needsGl32 = false)
-        val plan = LaunchPlanner(dirs, android).plan(LaunchInput(Profile(name = "A", versionId = "1.20.1"), rv, fakeRuntime(tempDir(), 17, "aarch64", true), offline,
-            Gl4esBackend().configure(renv, emptyMap()), 1536, 1920, 1080, tempDir(), comp, tempDir().resolve("libcsglfw.so")))
-        val cp = plan.classpath
-        assertTrue(cp.none { it.contains("org/lwjgl/lwjgl/3.3.1") }, "Mojang LWJGL replaced"); assertTrue(cp.any { it.endsWith("jars/lwjgl.jar") })
-        assertTrue(plan.jvmArgs.any { it.startsWith("-Dorg.lwjgl.glfw.libname=") && it.endsWith("libcsglfw.so") })
-        assertTrue(plan.jvmArgs.any { it == "-Dorg.lwjgl.opengl.libname=$gl4es" })
-        assertEquals("21", plan.env["LIBGL_GL"]); assertEquals("EGL_GLES2", plan.rendererContext)
-        assertTrue(plan.jvmArgs.none { it.startsWith("-Dorg.lwjgl.sdl.libname=") || it.startsWith("-Dorg.lwjgl.shaderc.libname=") }, "LWJGL 3.3: no 3.4 properties")
-        val n = JvmOptionNormalizer.normalize(plan.jvmArgs)
-        assertTrue(n.options.any { it.startsWith("-Djava.class.path=") }); assertFalse("-cp" in n.options)
-    }
-
-    @Test fun androidPlanForLwjgl34AddsSdlBridgeAndShaderToolchain() {
-        val dirs = LauncherDirs(tempDir())
-        val rv = Installer(dirs, http, DownloadManager(http), android).resolveLibraries(meta, listOf("1.20.1"), "1.20.1")
-        val compDir = tempDir(); Files.createDirectories(compDir.resolve("lib"))
-        val comp = InstalledComponent(ComponentManifest(1, "lwjgl34-android", "LWJGL", "3.4.3-r1", "lwjgl", "arm64-v8a", "BSD-3-Clause", "test",
-            listOf("lwjgl:3.4.3", "lib:libshaderc.so", "lib:libspirv-cross.so"), listOf("jars/lwjgl.jar"), "lib", emptyList()), compDir)
-        val mg = tempDir().resolve("libmobileglues.so").also { Files.write(it, ByteArray(1)) }
-        val renv = env(android, mapOf("libmobileglues.so" to mg), needsGl32 = true)
-        val shim = tempDir().resolve("libcsglfw.so")
-        val plan = LaunchPlanner(dirs, android).plan(LaunchInput(Profile(name = "B", versionId = "26.3"), rv, fakeRuntime(tempDir(), 25, "aarch64", true), offline,
-            MobileGluesBackend().configure(renv, emptyMap()), 2048, 1920, 1080, tempDir(), comp, shim))
-        val lib = compDir.resolve("lib").toAbsolutePath()
-        assertTrue("-Dorg.lwjgl.sdl.libname=${shim.toAbsolutePath()}" in plan.jvmArgs, "SDL3 calls go to the bridge in libcsglfw.so")
-        assertTrue("-Dorg.lwjgl.glfw.libname=${shim.toAbsolutePath()}" in plan.jvmArgs, "26.1/26.2 still use GLFW")
-        assertTrue("-Dorg.lwjgl.shaderc.libname=${lib.resolve("libshaderc.so")}" in plan.jvmArgs)
-        assertTrue("-Dorg.lwjgl.spvc.libname=${lib.resolve("libspirv-cross.so")}" in plan.jvmArgs)
-        val vk = plan.jvmArgs.single { it.startsWith("-Dorg.lwjgl.vulkan.libname=") }.substringAfter('=')
-        assertFalse(Files.exists(java.nio.file.Paths.get(vk)), "Vulkan deliberately unavailable -> Minecraft stays on OpenGL")
-        // AndroidRuntimeEnv must not override it with the system loader
-        val e = AndroidRuntimeEnv.build("/r/lib/server/libjvm.so", 25, listOf(lib.toString()), emptyMap(), "/t", "/g", "/r", "UTC", "14", plan.jvmArgs)
-        assertTrue(e.jvmOptions.none { it.startsWith("-Dorg.lwjgl.vulkan.libname=") })
-    }
-
-    @Test fun invalidUserJvmArgsAreRejected() {
-        val dirs = LauncherDirs(tempDir())
-        val rv = Installer(dirs, http, DownloadManager(http), linux).resolveLibraries(meta, listOf("1.20.1"), "1.20.1")
-        assertFailsWith<LaunchPlanException> {
-            LaunchPlanner(dirs, linux).plan(LaunchInput(Profile(name = "x", versionId = "1.20.1", jvmArgs = "-cp evil.jar"), rv, fakeRuntime(tempDir(), 17), offline, SystemGlBackend().configure(env(linux), emptyMap()), 1024, 0, 0, tempDir()))
+    @Test
+    fun stateMachineRejectsIllegalTransitions() {
+        val sm = LaunchStateMachine()
+        assertEquals(LaunchState.IDLE, sm.state)
+        sm.advance(LaunchState.VALIDATING)
+        var threw = false
+        try {
+            sm.advance(LaunchState.IDLE)
+        } catch (_: IllegalLaunchTransition) {
+            threw = true
         }
+        assertTrue("Going backwards must be refused", threw)
+        sm.advance(LaunchState.PREPARING_RUNTIME)
+        sm.advance(LaunchState.PREPARING_RENDERER)
+        sm.advance(LaunchState.INITIALIZING_GAME)
+        sm.advance(LaunchState.RUNNING)
+        sm.advance(LaunchState.EXITED)
+        // A finished launch can start again; that is the only way back from EXITED.
+        sm.advance(LaunchState.VALIDATING)
+        assertEquals(LaunchState.VALIDATING, sm.state)
     }
 
-    @Test fun normalizerHandlesModuleOptions() {
-        val r = JvmOptionNormalizer.normalize(listOf("-cp", "a:b", "--add-opens", "java.base/java.lang=ALL-UNNAMED", "-XstartOnFirstThread", "-Xmx1g"))
-        assertEquals(listOf("-Djava.class.path=a:b", "--add-opens=java.base/java.lang=ALL-UNNAMED", "-Xmx1g"), r.options)
-        assertEquals(listOf("-XstartOnFirstThread"), r.dropped)
-    }
-
-    @Test fun stateMachineTransitionsAndFailureStage() {
+    @Test
+    fun failureRecordsTheStage() {
         val sm = LaunchStateMachine()
-        sm.advance(LaunchState.VALIDATING); sm.advance(LaunchState.PREPARING_RUNTIME)
-        assertFailsWith<IllegalLaunchTransition> { sm.advance(LaunchState.VALIDATING) }
-        sm.fail("no runtime")
-        assertEquals(LaunchState.FAILED, sm.state); assertEquals(LaunchState.PREPARING_RUNTIME, sm.status.value.failedAt)
-        sm.advance(LaunchState.VALIDATING) // retry allowed after failure
-        listOf(LaunchState.PREPARING_RUNTIME, LaunchState.PREPARING_RENDERER, LaunchState.INITIALIZING_GAME, LaunchState.LOADING_GAME, LaunchState.RUNNING, LaunchState.EXITED).forEach { sm.advance(it) }
-        assertEquals(LaunchState.EXITED, sm.state)
+        sm.advance(LaunchState.VALIDATING)
+        sm.advance(LaunchState.PREPARING_RUNTIME)
+        sm.fail("no java")
+        assertEquals(LaunchState.FAILED, sm.state)
+        assertEquals(LaunchState.PREPARING_RUNTIME, sm.status.value.failedAt)
+        assertEquals("no java", sm.status.value.message)
+        sm.reset()
+        assertEquals(LaunchState.IDLE, sm.state)
     }
 
-    @Test fun launchLocksPreventDuplicates() {
-        assertTrue(LaunchLocks.tryAcquire("p1")); assertFalse(LaunchLocks.tryAcquire("p1")); LaunchLocks.release("p1"); assertTrue(LaunchLocks.tryAcquire("p1")); LaunchLocks.release("p1")
+    @Test
+    fun placeholderSubstitutionRecordsUnresolvedNames() {
+        val unresolved = mutableSetOf<String>()
+        val out = ArgumentBuilder.substitute(
+            "--username ${'$'}{auth_player_name} --x ${'$'}{nope}",
+            mapOf("auth_player_name" to "Steve"),
+            unresolved
+        )
+        assertEquals("--username Steve --x ${'$'}{nope}", out)
+        assertEquals(setOf("nope"), unresolved)
     }
 
-    @Test fun startupMilestonesFromRealLogLines() {
+    @Test
+    fun rulesFilterArguments() {
+        val android = TestWorld.platform(android = true)
+        val entries = listOf(
+            ArgumentEntry(listOf("--demo"), listOf(Rule(allow = true, osName = null, osVersion = null, osArch = null, features = mapOf("is_demo_user" to true)))),
+            ArgumentEntry(listOf("--always"), emptyList())
+        )
+        assertEquals(listOf("--always"), ArgumentBuilder.expand(entries, android, LaunchFeatures()))
+        assertEquals(listOf("--demo", "--always"), ArgumentBuilder.expand(entries, android, LaunchFeatures(isDemoUser = true)))
+    }
+
+    @Test
+    fun jvmOptionsAreJoinedForJni() {
+        val result = JvmOptionNormalizer.normalize(
+            listOf("-cp", "a.jar:b.jar", "--add-opens", "java.base/java.io=ALL-UNNAMED", "-Xmx2048M", "-XstartOnFirstThread")
+        )
+        assertTrue(result.options.contains("-Djava.class.path=a.jar:b.jar"))
+        assertTrue(result.options.contains("--add-opens=java.base/java.io=ALL-UNNAMED"))
+        assertTrue(result.options.contains("-Xmx2048M"))
+        assertEquals(listOf("-XstartOnFirstThread"), result.dropped)
+        // Anything with a space would be split again by the JVM launcher.
+        assertFalse(result.options.any { it.contains(" ") })
+    }
+
+    @Test
+    fun planRedactsTheAccessToken() {
+        val plan = LaunchPlan(
+            profileId = "p", profileName = "P", versionId = "1.20.1",
+            mainClass = "net.minecraft.client.main.Main",
+            javaHome = "/java", javaMajor = 17, javaExecutable = "/java/bin/java", libjvm = null,
+            classpath = listOf("/a.jar"), nativeDirs = listOf("/n"),
+            jvmArgs = listOf("-Xmx2G"),
+            gameArgs = listOf("--username", "Steve", "--accessToken", "SuperSecretToken123"),
+            workingDir = "/game", env = emptyMap(), rendererId = "gl4es", rendererContext = "EGL_GLES2",
+            rendererLibraries = emptyMap(), controlLayoutId = "default-touch",
+            sessionDir = "/s", logFile = "/s/game.log", width = 800, height = 600
+        )
+        val text = plan.redactedCommandLine()
+        assertFalse("The token must never appear in a rendered command line", text.contains("SuperSecretToken123"))
+        assertTrue(text.contains("--username"))
+    }
+
+    @Test
+    fun planValidationCatchesRelativePaths() {
+        val plan = LaunchPlan(
+            profileId = "p", profileName = "P", versionId = "1.20.1",
+            mainClass = "Main", javaHome = "/java", javaMajor = 17, javaExecutable = "/java/bin/java", libjvm = null,
+            classpath = listOf("relative.jar"), nativeDirs = listOf("natives"),
+            jvmArgs = emptyList(), gameArgs = emptyList(), workingDir = "/game", env = emptyMap(),
+            rendererId = "gl4es", rendererContext = "EGL_GLES2", rendererLibraries = emptyMap(),
+            controlLayoutId = "l", sessionDir = "/s", logFile = "/s/log", width = 0, height = 600
+        )
+        val problems = plan.validate()
+        assertTrue(problems.any { it.contains("Classpath") })
+        assertTrue(problems.any { it.contains("Native directory") })
+        assertTrue(problems.any { it.contains("window size") })
+    }
+
+    @Test
+    fun androidRuntimeEnvComputesJavaHomeForModernAndLegacyLayouts() {
+        val modern = AndroidRuntimeEnv.build(
+            libjvm = "/rt/lib/server/libjvm.so", javaMajor = 17, nativeDirs = listOf("/n"),
+            rendererLibraries = mapOf("gl" to "/r/libgl.so"), sessionTmp = "/s/tmp", gameDir = "/game",
+            resolvConf = "/s/resolv.conf", timeZoneId = "Asia/Kolkata", androidRelease = "14",
+            existingJvmArgs = emptyList()
+        )
+        assertEquals("/rt", modern.env["JAVA_HOME"])
+        assertTrue(modern.linkerPath.contains("/rt/lib/server"))
+        assertTrue(modern.linkerPath.contains("/n"))
+        assertTrue(modern.jvmOptions.any { it.startsWith("-Duser.timezone=") })
+        assertTrue(modern.jvmOptions.any { it.startsWith("-Dext.net.resolvPath=") })
+
+        val legacy = AndroidRuntimeEnv.build(
+            libjvm = "/jre/lib/aarch64/server/libjvm.so", javaMajor = 8, nativeDirs = emptyList(),
+            rendererLibraries = emptyMap(), sessionTmp = "/s", gameDir = "/g", resolvConf = "/r",
+            timeZoneId = "UTC", androidRelease = "13", existingJvmArgs = listOf("-Djava.home=/custom")
+        )
+        assertEquals("/jre", legacy.env["JAVA_HOME"])
+        assertFalse("An existing -Djava.home must not be overridden", legacy.jvmOptions.any { it.startsWith("-Djava.home=") })
+    }
+
+    @Test
+    fun resolvConfSkipsUnusableAddresses() {
+        val text = AndroidRuntimeEnv.resolvConf(listOf("192.168.1.1", "fe80::1%wlan0", ""))
+        assertTrue(text.contains("192.168.1.1"))
+        assertFalse(text.contains("fe80"))
+        assertEquals("nameserver 8.8.8.8\nnameserver 1.1.1.1\n", AndroidRuntimeEnv.resolvConf(emptyList()))
+    }
+
+    @Test
+    fun startupMonitorReachesTitleScreen() {
         val seen = mutableListOf<Milestone>()
-        val m = StartupMonitor { ms, _ -> seen += ms }
-        listOf("[12:00:00] [main/INFO]: Setting user: Steve", "[Render thread/INFO]: Backend library: LWJGL version 3.3.1 SNAPSHOT",
-            "[Render thread/INFO]: Reloading ResourceManager: vanilla", "[Render thread/INFO]: Sound engine started",
-            "[Render thread/INFO]: Created: 1024x512x4 minecraft:textures/atlas/blocks.png-atlas").forEach(m::onLine)
-        assertEquals(listOf(Milestone.JVM_STARTED, Milestone.MAIN_ENTERED, Milestone.GAME_INIT, Milestone.RENDER_INIT, Milestone.READY), seen)
-        assertEquals(LaunchState.RUNNING, m.stateFor())
-        val c = StartupMonitor(); c.onLine("Error: Could not find or load main class net.minecraft.client.main.Main")
-        assertTrue(Milestone.CRASH_DETECTED in c.milestones)
+        val monitor = StartupMonitor { m, _ -> seen += m }
+        monitor.markJvmStarted()
+        monitor.onLine("[12:00:00] [main/INFO]: Setting user: Steve")
+        monitor.onLine("[12:00:00] [Render thread/INFO]: Backend library: LWJGL version 3.3.1")
+        monitor.onLine("[12:00:00] [Render thread/INFO]: Sound engine started")
+        assertTrue(monitor.reachedTitleScreen)
+        assertEquals(LaunchState.RUNNING, monitor.stateFor())
+        assertFalse(monitor.crashed)
+        assertEquals(Milestone.MAIN_ENTERED, seen[1])
     }
 
-    @Test fun preflightReportsSpecificCorrectiveActions() = runTest {
-        val dirs = LauncherDirs(tempDir()); dirs.createBase()
-        val inst = Installer(dirs, http, DownloadManager(http), linux)
-        val coord = LaunchCoordinator(dirs, linux, inst, RuntimeManager(dirs, linux), RendererRegistry(), null)
-        val req = LaunchRequest(Profile(name = "P", versionId = "1.20.1"), { offline }, { env(linux) }, DeviceFacts(8192, true, 0, 8, false), 854, 480)
-        val e = assertFailsWith<LaunchBlockedException> { coord.prepare(req, LaunchStateMachine()) }
-        assertEquals(FixAction.INSTALL_VERSION, e.issues.first().fix)
-        // Install metadata only: verification must request a repair, and the missing runtime is reported next.
-        Files.createDirectories(dirs.versionDir("1.20.1")); Files.writeString(dirs.versionJson("1.20.1"), MetadataTest().modern)
-        val sm = LaunchStateMachine()
-        val e2 = assertFailsWith<LaunchBlockedException> { coord.prepare(req, sm) }
-        assertTrue(e2.issues.any { it.fix == FixAction.REPAIR_INSTALLATION })
-        assertEquals(LaunchState.VALIDATING, sm.status.value.failedAt)
-        val noAccount = req.copy(session = { throw AuthException("expired") })
-        assertTrue(assertFailsWith<LaunchBlockedException> { coord.prepare(noAccount, LaunchStateMachine()) }.issues.any { it.fix == FixAction.SIGN_IN })
+    @Test
+    fun benignErrorsAreNotCrashes() {
+        val monitor = StartupMonitor()
+        monitor.markJvmStarted()
+        monitor.onLine("Failed to open OpenAL device")
+        monitor.onLine("Narrator library not found")
+        monitor.onLine("Realms server unavailable")
+        assertFalse(monitor.crashed)
     }
 
-    companion object {
-        fun env(p: PlatformInfo, libs: Map<String, Path> = emptyMap(), needsGl32: Boolean = true, vulkan: String? = "1.1.0", gles: Int = 32) =
-            RendererEnvironment(p, 34, gles, vulkan, libs, "1.20.1", true, needsGl32)
+    @Test
+    fun fatalMarkerIsACrash() {
+        val monitor = StartupMonitor()
+        monitor.markJvmStarted()
+        monitor.onLine("---- Minecraft Crash Report ----")
+        assertTrue(monitor.crashed)
+        assertTrue(monitor.summary().startsWith("Crashed"))
+    }
+
+    @Test
+    fun log4jXmlIsFlattened() {
+        val converter = Log4jXml()
+        assertTrue(converter.feed("<log4j:Event logger=\"x\" level=\"WARN\" timestamp=\"1700000000000\" thread=\"main\">").isEmpty())
+        val lines = converter.feed("<log4j:Message><![CDATA[Something happened]]></log4j:Message>")
+        assertEquals(1, lines.size)
+        assertTrue(lines.first().contains("[main/WARN]"))
+        assertTrue(lines.first().contains("Something happened"))
+        // Plain output passes through untouched.
+        assertEquals(listOf("plain stdout"), converter.feed("plain stdout"))
     }
 }

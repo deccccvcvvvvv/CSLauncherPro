@@ -1,63 +1,62 @@
 package pro.cslauncher.core
 
-import com.sun.net.httpserver.HttpServer
+import pro.cslauncher.core.download.DownloadManager
+import pro.cslauncher.core.install.LauncherDirs
+import pro.cslauncher.core.net.HttpResponse
+import pro.cslauncher.core.net.HttpTransport
+import pro.cslauncher.core.platform.PlatformInfo
 import pro.cslauncher.core.util.Hashing
-import java.io.ByteArrayOutputStream
-import java.net.InetSocketAddress
+import java.io.ByteArrayInputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicInteger
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
 
-/** Real HTTP server for download/installer tests, with failure injection and Range support. */
-class LocalHttp : AutoCloseable {
-    val files = ConcurrentHashMap<String, ByteArray>()
-    val failuresBeforeSuccess = ConcurrentHashMap<String, AtomicInteger>()
-    val corrupt = ConcurrentHashMap.newKeySet<String>()
-    val hits = ConcurrentHashMap<String, AtomicInteger>()
-    val rangeRequests = AtomicInteger()
-    @Volatile var truncateFirstResponse: String? = null
-    private val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
-    val base: String
+/** A transport backed by an in-memory URL map: no network in tests, and failures are reproducible. */
+class FakeTransport(
+    private val routes: MutableMap<String, ByteArray> = ConcurrentHashMap(),
+    private val statuses: MutableMap<String, Int> = ConcurrentHashMap()
+) : HttpTransport {
 
-    init {
-        server.createContext("/") { ex ->
-            val path = ex.requestURI.path
-            hits.computeIfAbsent(path) { AtomicInteger() }.incrementAndGet()
-            val fail = failuresBeforeSuccess[path]
-            val data = files[path]
-            when {
-                fail != null && fail.getAndDecrement() > 0 -> { ex.sendResponseHeaders(503, -1); ex.close() }
-                data == null -> { ex.sendResponseHeaders(404, -1); ex.close() }
-                else -> {
-                    var body = if (path in corrupt) data.copyOf().also { if (it.isNotEmpty()) it[0] = (it[0] + 1).toByte() } else data
-                    val range = ex.requestHeaders.getFirst("Range")
-                    if (range != null && range.startsWith("bytes=")) {
-                        rangeRequests.incrementAndGet()
-                        val from = range.removePrefix("bytes=").substringBefore('-').toInt()
-                        body = body.copyOfRange(from, body.size)
-                        ex.responseHeaders.add("Content-Range", "bytes $from-${data.size - 1}/${data.size}")
-                        ex.sendResponseHeaders(206, body.size.toLong())
-                    } else ex.sendResponseHeaders(200, body.size.toLong())
-                    if (truncateFirstResponse == path) { truncateFirstResponse = null; ex.responseBody.write(body, 0, body.size / 2); ex.responseBody.flush(); ex.close(); return@createContext }
-                    ex.responseBody.use { it.write(body) }
-                }
-            }
-        }
-        server.start()
-        base = "http://127.0.0.1:${server.address.port}"
+    val requestCount = java.util.concurrent.atomic.AtomicInteger()
+    val requestedHeaders = mutableListOf<Map<String, String>>()
+
+    fun put(url: String, body: String) = apply { routes[url] = body.toByteArray() }
+    fun putBytes(url: String, body: ByteArray) = apply { routes[url] = body }
+    fun status(url: String, code: Int) = apply { statuses[url] = code }
+
+    override fun open(url: String, headers: Map<String, String>, method: String, body: ByteArray?): HttpResponse {
+        requestCount.incrementAndGet()
+        requestedHeaders += headers
+        val status = statuses[url] ?: 200
+        val bytes = routes[url] ?: ByteArray(0)
+        return HttpResponse(
+            code = status,
+            headers = mapOf("Content-Length" to listOf(bytes.size.toString())),
+            body = ByteArrayInputStream(bytes),
+            onClose = {}
+        )
     }
-    fun put(path: String, data: ByteArray): String { files[path] = data; return base + path }
-    override fun close() = server.stop(0)
+
+    fun downloads(): DownloadManager = DownloadManager(this, maxConcurrency = 3, maxAttempts = 2, retryBaseDelayMs = 1)
 }
 
-fun sha1(b: ByteArray) = Hashing.sha1(b)
-fun tempDir(prefix: String = "cs"): Path = Files.createTempDirectory(prefix)
+object TestWorld {
+    fun dirs(): LauncherDirs {
+        val root = Files.createTempDirectory("cs-test")
+        val dirs = LauncherDirs(root)
+        dirs.createBase()
+        return dirs
+    }
 
-fun zipBytes(entries: Map<String, ByteArray>): ByteArray {
-    val bos = ByteArrayOutputStream()
-    ZipOutputStream(bos).use { z -> entries.forEach { (n, d) -> z.putNextEntry(ZipEntry(n)); z.write(d); z.closeEntry() } }
-    return bos.toByteArray()
+    fun platform(android: Boolean = false): PlatformInfo =
+        if (android) PlatformInfo.android(abi = "arm64-v8a", release = "14", api = 34, glesVersion = 32, vulkanApi = "1.1.128")
+        else PlatformInfo.host()
+
+    fun sha1(bytes: ByteArray): String = Hashing.sha1(bytes)
+    fun sha256(bytes: ByteArray): String = Hashing.sha256(bytes)
+    fun tmpFile(content: String, suffix: String = ".txt"): Path {
+        val f = Files.createTempFile("cs-test", suffix)
+        Files.writeString(f, content)
+        return f
+    }
 }

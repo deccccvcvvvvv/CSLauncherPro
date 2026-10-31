@@ -2,52 +2,99 @@ package pro.cslauncher.core.install
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import pro.cslauncher.core.download.*
-import pro.cslauncher.core.meta.*
+import pro.cslauncher.core.download.BatchProgress
+import pro.cslauncher.core.download.DownloadFailedException
+import pro.cslauncher.core.download.DownloadManager
+import pro.cslauncher.core.download.DownloadTask
+import pro.cslauncher.core.download.InsufficientStorageException
+import pro.cslauncher.core.meta.AssetIndex
+import pro.cslauncher.core.meta.AssetObject
+import pro.cslauncher.core.meta.Download
+import pro.cslauncher.core.meta.LaunchFeatures
+import pro.cslauncher.core.meta.Library
+import pro.cslauncher.core.meta.NativeClassifier
+import pro.cslauncher.core.meta.VersionManifest
+import pro.cslauncher.core.meta.VersionMetadata
 import pro.cslauncher.core.net.HttpTransport
 import pro.cslauncher.core.platform.PlatformInfo
-import pro.cslauncher.core.util.*
+import pro.cslauncher.core.util.CsLog
+import pro.cslauncher.core.util.FsUtil
+import pro.cslauncher.core.util.Integrity
+import pro.cslauncher.core.util.MetadataException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.util.zip.ZipFile
 
 enum class InstallStage(val title: String) {
-    RESOLVE("Resolving version"), DIRECTORIES("Creating directories"), CLIENT("Downloading client"),
-    LIBRARIES("Downloading libraries"), ASSETS("Downloading assets"), NATIVES("Preparing native libraries"),
-    LOADER("Installing mod loader"), VERIFY("Verifying installation")
+    RESOLVE("Resolving version"),
+    DIRECTORIES("Creating directories"),
+    CLIENT("Downloading client"),
+    LIBRARIES("Downloading libraries"),
+    ASSETS("Downloading assets"),
+    NATIVES("Preparing native libraries"),
+    LOADER("Installing mod loader"),
+    VERIFY("Verifying installation")
 }
 
 data class InstallEvent(val stage: InstallStage, val message: String, val progress: BatchProgress? = null)
 
-class InstallException(val stage: InstallStage, message: String, cause: Throwable? = null) : Exception("[${stage.title}] $message", cause)
+class InstallException(val stage: InstallStage, message: String, cause: Throwable? = null) :
+    Exception("[${stage.title}] $message", cause)
 
-/** How each library resolves for the current platform. */
-data class ResolvedLibrary(val library: Library, val file: Path, val download: Download?, val isNative: Boolean, val onClasspath: Boolean)
-
-/** Everything needed to install/verify/launch one version on one platform. */
-data class ResolvedVersion(
-    val meta: VersionMetadata,
-    val chain: List<String>,                // [child, parent, ...]
-    val jarVersionId: String,               // version whose client jar is used
-    val libraries: List<ResolvedLibrary>,
-    val skippedByRules: List<String>,
-    val desktopNativesReplaced: List<String>, // Android: glibc natives that must come from an Android component
+/** A library resolved for this platform, with the file it must end up at. */
+data class ResolvedLibrary(
+    val library: Library,
+    val file: Path,
+    val download: Download?,
+    val isNative: Boolean,
+    val onClasspath: Boolean
 )
 
+data class ResolvedVersion(
+    val meta: VersionMetadata,
+    val chain: List<String>,
+    val jarVersionId: String,
+    val libraries: List<ResolvedLibrary>,
+    val skippedByRules: List<String>,
+    /** glibc natives from the metadata that Android cannot load; a component supplies them instead. */
+    val desktopNativesReplaced: List<String>
+) {
+    val classpathFiles: List<Path> get() = libraries.filter { it.onClasspath }.map { it.file }
+    val nativeLibraries: List<ResolvedLibrary> get() = libraries.filter { it.isNative }
+}
+
+/**
+ * Resolves a version and installs it.
+ *
+ * Design rules:
+ * * **Resolve is pure metadata work** — it never writes files, so the UI can show exactly what a
+ *   version needs before anything is downloaded.
+ * * **Re-installing is cheap** — the download engine skips files whose integrity matches, so
+ *   `install()` on an intact version performs no network traffic.
+ * * **Natives on Android come from the launcher, not from Mojang.** Mojang's native classifiers are
+ *   glibc builds for desktop Linux; they cannot be loaded on Bionic. They are recorded in
+ *   [ResolvedVersion.desktopNativesReplaced] and kept off the classpath, and the Android component
+ *   pack supplies the real ones.
+ * * **Every failure is stage-tagged** ([InstallException.stage]) so the UI can point at what broke.
+ */
 class Installer(
     private val dirs: LauncherDirs,
     private val http: HttpTransport,
     private val downloads: DownloadManager,
-    private val platform: PlatformInfo,
+    val platform: PlatformInfo,
     private val assetBaseUrl: String = AssetObject.DEFAULT_BASE,
+    private val features: LaunchFeatures = LaunchFeatures()
 ) {
-    // ---------- Stage 1: resolve ----------
+
+    /** Reads (or fetches) the version JSON chain and builds the file list for this platform. */
     suspend fun resolve(versionId: String, manifest: VersionManifest?): ResolvedVersion = withContext(Dispatchers.IO) {
         val chain = mutableListOf<String>()
         var meta = loadOrFetchJson(versionId, manifest)
         chain += meta.id
         var current = meta
         var jarId = if (current.clientDownload != null) current.id else versionId
+
         while (current.inheritsFrom != null) {
             val parentId = current.inheritsFrom!!
             if (parentId in chain) throw MetadataException("Circular inheritsFrom chain: ${chain + parentId}")
@@ -58,106 +105,196 @@ class Installer(
             current = parent
         }
         if (meta.mainClass.isBlank()) throw MetadataException("Resolved version $versionId has no main class")
+        if (Files.isRegularFile(dirs.versionJar(jarId))) {
+            // The jar may be named after the child while coming from the parent; keep the real one.
+        }
         resolveLibraries(meta, chain, jarId)
     }
 
-    fun resolveLibraries(meta: VersionMetadata, chain: List<String>, jarId: String): ResolvedVersion {
-        val out = mutableListOf<ResolvedLibrary>(); val skipped = mutableListOf<String>(); val replaced = mutableListOf<String>()
-        val bitsArch = if (platform.is64Bit) "64" else "32"
-        for (lib in meta.libraries) {
-            if (!RuleEvaluator.allowed(lib.rules, platform)) { skipped += lib.name; continue }
-            // Legacy natives: classifier chosen through the "natives" map.
-            if (lib.natives.isNotEmpty()) {
-                val cls = lib.natives[platform.osName]?.replace("\${arch}", bitsArch)
-                if (cls != null) {
-                    if (platform.isAndroid) replaced += "${lib.name}:$cls"
-                    else {
-                        val d = lib.classifiers[cls] ?: Download(
-                            (lib.mavenBaseUrl ?: "https://libraries.minecraft.net/").trimEnd('/') + "/" + lib.coordinate.withClassifier(cls).path(),
-                            Integrity(), lib.coordinate.withClassifier(cls).path())
-                        out += ResolvedLibrary(lib, dirs.libraryFile(d.path ?: lib.coordinate.withClassifier(cls).path()), d, isNative = true, onClasspath = false)
-                    }
-                }
-                if (lib.artifact != null) out += ResolvedLibrary(lib, dirs.libraryFile(lib.artifact.path ?: lib.coordinate.path()), lib.artifact, false, true)
-                continue
-            }
-            if (lib.isNativeClassifierCoordinate) {
-                // Modern (1.19+) natives are separate coordinates such as org.lwjgl:lwjgl:3.3.1:natives-linux.
-                if (platform.isAndroid) { replaced += lib.name; continue }
-                val a = lib.artifact ?: continue
-                out += ResolvedLibrary(lib, dirs.libraryFile(a.path ?: lib.coordinate.path()), a, isNative = true, onClasspath = true)
-                continue
-            }
-            val a = lib.artifact
-            val path = a?.path ?: lib.coordinate.path()
-            out += ResolvedLibrary(lib, dirs.libraryFile(path), a, isNative = false, onClasspath = true)
-        }
-        // Drop exact duplicates of the same file (same artifact listed twice).
-        val dedup = out.distinctBy { it.file.toString() + it.isNative }
-        return ResolvedVersion(meta, chain, jarId, dedup, skipped, replaced)
-    }
-
     private suspend fun loadOrFetchJson(id: String, manifest: VersionManifest?): VersionMetadata {
-        val f = dirs.versionJson(id)
+        val file = dirs.versionJson(id)
         val entry = manifest?.find(id)
-        if (Files.isRegularFile(f)) {
-            val valid = entry?.sha1 == null || Hashing.sha1(f).equals(entry.sha1, true)
-            if (valid) return runCatching { VersionMetadata.parse(pro.cslauncher.core.util.FsUtil.readText(f)) }.getOrElse {
-                throw MetadataException("Stored metadata for $id is corrupt (${it.message}). Use Repair to re-download it.", it)
+        if (Files.isRegularFile(file)) {
+            val text = FsUtil.readText(file)
+            val valid = entry?.sha1 == null || runCatching { pro.cslauncher.core.util.Hashing.sha1(file) }
+                .getOrNull()?.equals(entry.sha1, ignoreCase = true) == true
+            if (valid) {
+                return runCatching { VersionMetadata.parse(text) }.getOrElse {
+                    CsLog.w("Installer", "Cached metadata for $id is unusable, re-fetching: ${it.message}")
+                    fetchJson(id, entry?.url ?: throw MetadataException(it.message ?: "unreadable metadata"), file)
+                }
             }
-            CsLog.w("Installer", "Metadata for $id changed upstream or is corrupt; re-downloading")
         }
-        if (entry == null) throw MetadataException("Version '$id' is not installed and is not in the official version list")
-        val r = downloads.downloadOne(DownloadTask(entry.url, f, Integrity(sha1 = entry.sha1), "$id.json"))
-        if (r.state == TaskState.FAILED) throw MetadataException("Could not download metadata for $id: ${r.error}")
-        return VersionMetadata.parse(pro.cslauncher.core.util.FsUtil.readText(f))
+        val url = entry?.url
+            ?: throw MetadataException("Version $id is not installed and is not in the version list")
+        return fetchJson(id, url, file)
     }
 
-    // ---------- Plan downloads (used by install and targeted repair) ----------
+    private suspend fun fetchJson(id: String, url: String, file: Path): VersionMetadata {
+        CsLog.i("Installer", "Fetching metadata for $id")
+        val text = withContext(Dispatchers.IO) { http.getText(url) }
+        // Validate before writing: a broken JSON must not replace a good cached copy.
+        val meta = VersionMetadata.parse(text)
+        FsUtil.writeAtomic(file, text)
+        return meta
+    }
+
+    /**
+     * Chooses libraries, natives and classpath entries for [platform].
+     *
+     * Android specifics:
+     * * Mojang's `natives-linux` classifiers are glibc; loading one on Bionic crashes the process
+     *   with an unrelated error, so they are skipped and reported instead.
+     * * LWJGL natives are supplied by the launcher's component pack, so the desktop ones must not be
+     *   extracted on top of them.
+     */
+    fun resolveLibraries(meta: VersionMetadata, chain: List<String>, jarId: String): ResolvedVersion {
+        val out = mutableListOf<ResolvedLibrary>()
+        val skipped = mutableListOf<String>()
+        val replaced = mutableListOf<String>()
+
+        for (lib in meta.libraries) {
+            if (!pro.cslauncher.core.meta.Rule.allows(lib.rules, platform, features)) {
+                skipped += lib.name
+                continue
+            }
+
+            // Native classifiers (LWJGL/JInput style, or modern "natives-*" coordinates).
+            if (lib.natives.isNotEmpty()) {
+                val chosen = lib.nativeDownload(platform)
+                if (chosen == null) {
+                    skipped += lib.name
+                    continue
+                }
+                if (platform.isAndroid) {
+                    // glibc build: a launcher component replaces it, so it is never installed here.
+                    replaced += lib.name
+                    if (lib.onClasspath(platform, features)) {
+                        out += ResolvedLibrary(
+                            lib,
+                            dirs.libraryFile(lib.artifact!!.path ?: lib.coordinate.path()),
+                            lib.artifact,
+                            isNative = false,
+                            onClasspath = true
+                        )
+                    }
+                    continue
+                }
+                val (classifier, download) = chosen
+                out += ResolvedLibrary(
+                    lib,
+                    dirs.libraryFile(download.path ?: lib.coordinate.withClassifier(classifier).path()),
+                    download,
+                    isNative = true,
+                    onClasspath = false
+                )
+                if (lib.onClasspath(platform, features)) {
+                    out += ResolvedLibrary(
+                        lib,
+                        dirs.libraryFile(lib.artifact!!.path ?: lib.coordinate.path()),
+                        lib.artifact,
+                        isNative = false,
+                        onClasspath = true
+                    )
+                }
+                continue
+            }
+
+            if (lib.isNativeClassifierCoordinate) {
+                // Modern style: the coordinate itself is the native jar.
+                if (platform.isAndroid) {
+                    replaced += lib.name
+                    continue
+                }
+                val a = lib.artifact ?: continue
+                out += ResolvedLibrary(lib, dirs.libraryFile(a.path ?: lib.coordinate.path()), a, true, false)
+                continue
+            }
+
+            val a = lib.artifact ?: continue
+            out += ResolvedLibrary(lib, dirs.libraryFile(a.path ?: lib.coordinate.path()), a, false, true)
+        }
+
+        val dedup = out.distinctBy { it.file.toString() + it.isNative }
+        return ResolvedVersion(meta, chain, jarId, dedup, skipped.distinct(), replaced.distinct())
+    }
+
+    // ---------------------------------------------------------------- tasks
+
     fun clientTask(rv: ResolvedVersion): DownloadTask? {
         val d = rv.meta.clientDownload ?: return null
         return DownloadTask(d.url, dirs.versionJar(rv.jarVersionId), d.integrity, "${rv.jarVersionId}.jar")
     }
+
     fun libraryTasks(rv: ResolvedVersion): List<DownloadTask> = rv.libraries.mapNotNull { rl ->
-        rl.download?.takeIf { it.url.isNotBlank() }?.let { DownloadTask(it.url, rl.file, it.integrity, rl.library.name) }
-    }
-    fun assetIndexTask(rv: ResolvedVersion): DownloadTask? = rv.meta.assetIndex?.let {
-        DownloadTask(it.url, dirs.assetIndexFile(it.id), Integrity(sha1 = it.sha1, size = it.size), "asset index ${it.id}")
-    }
-    fun assetTasks(index: AssetIndex): List<DownloadTask> = index.objects.distinctBy { it.hash }.map {
-        DownloadTask(it.url(assetBaseUrl), dirs.assetObjects.resolve(it.relativeObjectPath), Integrity(sha1 = it.hash, size = it.size.takeIf { s -> s >= 0 }), it.name)
-    }
-    fun loggingTask(rv: ResolvedVersion): DownloadTask? = rv.meta.logging?.let {
-        DownloadTask(it.download.url, dirs.logConfigs.resolve(LauncherDirs.checkId(it.fileId)), it.download.integrity, it.fileId)
+        rl.download?.takeIf { it.url.isNotBlank() }
+            ?.let { DownloadTask(it.url, rl.file, it.integrity, rl.library.name) }
     }
 
-    // ---------- Full installation ----------
-    suspend fun install(versionId: String, manifest: VersionManifest?, onEvent: (InstallEvent) -> Unit = {}): InstallReport {
+    fun assetIndexTask(rv: ResolvedVersion): DownloadTask? = rv.meta.assetIndex?.let {
+        DownloadTask(
+            it.url,
+            dirs.assetIndexFile(it.id),
+            Integrity.of(sha1 = it.sha1, size = it.size),
+            "asset index ${it.id}"
+        )
+    }
+
+    fun assetTasks(index: AssetIndex): List<DownloadTask> = index.uniqueObjects().map {
+        DownloadTask(
+            it.url(assetBaseUrl),
+            dirs.assetObjectPath(it.relativeObjectPath),
+            Integrity.of(sha1 = it.hash, size = it.size.takeIf { s -> s >= 0 }),
+            it.name
+        )
+    }
+
+    fun loggingTask(rv: ResolvedVersion): DownloadTask? = rv.meta.logging?.let {
+        DownloadTask(it.download.url, dirs.logConfigFile(it.fileId), it.download.integrity, it.fileId)
+    }
+
+    // ---------------------------------------------------------------- install
+
+    suspend fun install(
+        versionId: String,
+        manifest: VersionManifest?,
+        onEvent: (InstallEvent) -> Unit = {}
+    ): InstallReport {
         fun stage(s: InstallStage, msg: String, p: BatchProgress? = null) = onEvent(InstallEvent(s, msg, p))
+
         stage(InstallStage.RESOLVE, "Reading metadata for $versionId")
-        val rv = try { resolve(versionId, manifest) } catch (e: Exception) { throw InstallException(InstallStage.RESOLVE, e.message ?: "metadata error", e) }
+        val rv = try {
+            resolve(versionId, manifest)
+        } catch (e: Exception) {
+            throw InstallException(InstallStage.RESOLVE, e.message ?: "metadata error", e)
+        }
 
         stage(InstallStage.DIRECTORIES, "Preparing directories")
         withContext(Dispatchers.IO) { dirs.createBase() }
 
         suspend fun batch(s: InstallStage, name: String, tasks: List<DownloadTask>) {
             if (tasks.isEmpty()) return
-            val res = try { downloads.downloadAll(name, tasks) { stage(s, it.currentFile ?: name, it) } }
-                      catch (e: InsufficientStorageException) { throw InstallException(s, e.message!!, e) }
+            val res = try {
+                downloads.downloadAll(name, tasks) { stage(s, it.currentFile ?: name, it) }
+            } catch (e: InsufficientStorageException) {
+                throw InstallException(s, e.message!!, e)
+            }
             if (!res.ok) throw InstallException(s, res.summary(), DownloadFailedException(res))
         }
+
         batch(InstallStage.CLIENT, "$versionId client", listOfNotNull(clientTask(rv), loggingTask(rv)))
         batch(InstallStage.LIBRARIES, "$versionId libraries", libraryTasks(rv))
 
-        val idxTask = assetIndexTask(rv)
-        if (idxTask != null) {
+        rv.meta.assetIndex?.let { ref ->
+            val idxTask = assetIndexTask(rv)!!
             batch(InstallStage.ASSETS, "$versionId asset index", listOf(idxTask))
-            val index = withContext(Dispatchers.IO) { AssetIndex.parse(pro.cslauncher.core.util.FsUtil.readText(idxTask.destination)) }
+            val index = withContext(Dispatchers.IO) { AssetIndex.parse(FsUtil.readText(idxTask.destination)) }
             batch(InstallStage.ASSETS, "$versionId assets", assetTasks(index))
             withContext(Dispatchers.IO) { materializeVirtualAssets(rv, index) }
+            CsLog.i("Installer", "Asset index ${ref.id}: ${index.objects.size} objects")
         }
 
-        stage(InstallStage.NATIVES, if (platform.isAndroid) "Natives are provided by the Android runtime component" else "Extracting natives")
+        stage(InstallStage.NATIVES, if (platform.isAndroid) "Natives come from the Android runtime component" else "Extracting natives")
         withContext(Dispatchers.IO) { extractNatives(rv) }
 
         stage(InstallStage.VERIFY, "Verifying files")
@@ -166,7 +303,7 @@ class Installer(
         return report
     }
 
-    /** Legacy "virtual" asset indexes need a name-based copy under assets/virtual/<index>. */
+    /** Legacy "virtual" asset indexes need a name-based copy under `assets/virtual/<index>`. */
     fun materializeVirtualAssets(rv: ResolvedVersion, index: AssetIndex) {
         if (!index.virtual) return
         val id = rv.meta.assetIndex?.id ?: return
@@ -174,40 +311,86 @@ class Installer(
         for (o in index.objects) {
             val target = SafeZip.safeTarget(root, o.name)
             if (Files.isRegularFile(target) && Files.size(target) == o.size) continue
+            val source = dirs.assetObjectPath(o.relativeObjectPath)
+            if (!Files.isRegularFile(source)) continue
             Files.createDirectories(target.parent)
-            Files.copy(dirs.assetObjects.resolve(o.relativeObjectPath), target, StandardCopyOption.REPLACE_EXISTING)
+            Files.copy(source, target, StandardCopyOption.REPLACE_EXISTING)
         }
     }
 
-    /** Pre-1.6 "map_to_resources": copy into <gameDir>/resources at launch time (profile specific). */
+    /** Pre-1.6 `map_to_resources`: the game reads assets from `<gameDir>/resources`. */
     fun materializeResources(rv: ResolvedVersion, gameDir: Path) {
         val id = rv.meta.assetIndex?.id ?: return
-        val f = dirs.assetIndexFile(id); if (!Files.isRegularFile(f)) return
-        val index = AssetIndex.parse(pro.cslauncher.core.util.FsUtil.readText(f)); if (!index.mapToResources) return
+        val file = dirs.assetIndexFile(id)
+        if (!Files.isRegularFile(file)) return
+        val index = AssetIndex.parse(FsUtil.readText(file))
+        if (!index.mapToResources) return
         val root = gameDir.resolve("resources")
         for (o in index.objects) {
-            val t = SafeZip.safeTarget(root, o.name)
-            if (Files.isRegularFile(t) && Files.size(t) == o.size) continue
-            Files.createDirectories(t.parent); Files.copy(dirs.assetObjects.resolve(o.relativeObjectPath), t, StandardCopyOption.REPLACE_EXISTING)
+            val target = SafeZip.safeTarget(root, o.name)
+            if (Files.isRegularFile(target) && Files.size(target) == o.size) continue
+            Files.createDirectories(target.parent)
+            Files.copy(dirs.assetObjectPath(o.relativeObjectPath), target, StandardCopyOption.REPLACE_EXISTING)
         }
     }
 
-    /** Rebuilds the launcher-owned natives directory for desktop hosts (never touches user data). */
+    /**
+     * Extracts desktop natives into `natives/<version>` (Android gets its natives from a component
+     * pack instead). Extraction starts from an empty directory: a half-written `.so` is a launch
+     * crash that looks like a Java problem, which is the worst kind of bug to debug.
+     */
     fun extractNatives(rv: ResolvedVersion) {
         if (platform.isAndroid) return
         val out = dirs.nativesDir(rv.meta.id)
         if (Files.exists(out)) FsUtil.deleteTreeWithin(dirs.nativeRoot, out)
         Files.createDirectories(out)
+
         val nativeExt = Regex("\\.(so|dll|dylib|jnilib)$")
         for (rl in rv.libraries.filter { it.isNative }) {
-            if (!Files.isRegularFile(rl.file)) continue
+            if (!Files.isRegularFile(rl.file)) {
+                CsLog.w("Installer", "Native jar missing for ${rl.library.name}")
+                continue
+            }
             val excludes = rl.library.extractExclude.ifEmpty { listOf("META-INF/") }
-            SafeZip.extract(rl.file, out, filter = { name ->
-                excludes.none { name.startsWith(it) } && (rl.library.natives.isNotEmpty() || nativeExt.containsMatchIn(name))
-            })
+            runCatching {
+                SafeZip.extract(rl.file, out, filter = { name ->
+                    excludes.none { name.startsWith(it) } && nativeExt.containsMatchIn(name)
+                })
+            }.onFailure {
+                CsLog.e("Installer", "Cannot extract natives from ${rl.file.fileName}: ${it.message}")
+            }
         }
-        // Flatten modern natives (e.g. linux/x64/org/lwjgl/liblwjgl.so) so java.library.path finds them.
-        Files.walk(out).use { s -> s.filter { Files.isRegularFile(it) && it.parent != out && nativeExt.containsMatchIn(it.fileName.toString()) }.collect(java.util.stream.Collectors.toList()) }
-            .forEach { Files.move(it, out.resolve(it.fileName.toString()), StandardCopyOption.REPLACE_EXISTING) }
+
+        // Modern natives live in nested directories (linux/x64/org/lwjgl/…); java.library.path only
+        // looks at one level, so the libraries are flattened into the natives root.
+        runCatching {
+            Files.walk(out).use { stream ->
+                stream.filter { Files.isRegularFile(it) && it.parent != out && nativeExt.containsMatchIn(it.fileName.toString()) }
+                    .toList()
+                    .forEach { src -> Files.move(src, out.resolve(src.fileName.toString()), StandardCopyOption.REPLACE_EXISTING) }
+            }
+        }.onFailure { CsLog.w("Installer", "Could not flatten natives: ${it.message}") }
     }
+
+    /** Convenience for the UI: is this version usable on this device without downloading? */
+    suspend fun status(versionId: String, manifest: VersionManifest? = null): InstallReport = try {
+        Verifier(dirs, this, platform).verify(resolve(versionId, manifest), fullHash = false)
+    } catch (e: Exception) {
+        InstallReport(
+            versionId,
+            0,
+            listOf(InstallIssue(Component.METADATA, versionId, e.message ?: "unresolvable", null)),
+            emptyList()
+        )
+    }
+
+    /** Reads a native jar's shared-library names without extracting (diagnostics/component matching). */
+    fun nativeJarLibraries(jar: Path): List<String> = runCatching {
+        ZipFile(jar.toFile()).use { zf ->
+            zf.entries().asSequence()
+                .filter { !it.isDirectory && it.name.endsWith(".so") }
+                .map { it.name.substringAfterLast('/') }
+                .toList()
+        }
+    }.getOrDefault(emptyList())
 }

@@ -1,340 +1,320 @@
 package pro.cslauncher.core.controls
 
-import pro.cslauncher.core.settings.CursorMode
-import pro.cslauncher.core.settings.TapAction
-import pro.cslauncher.core.settings.TouchSettings
-import kotlin.math.hypot
-
-data class Geometry(
-    val widthPx: Int, val heightPx: Int, val density: Float,
-    val insetLeft: Int = 0, val insetTop: Int = 0, val insetRight: Int = 0, val insetBottom: Int = 0, val paddingPx: Int = 0,
-) {
-    val safeLeft get() = insetLeft + paddingPx
-    val safeTop get() = insetTop + paddingPx
-    val safeWidth get() = (widthPx - insetLeft - insetRight - 2 * paddingPx).coerceAtLeast(1)
-    val safeHeight get() = (heightPx - insetTop - insetBottom - 2 * paddingPx).coerceAtLeast(1)
-
-    fun rectOf(e: ControlElement): Rect {
-        val w = e.widthDp * density; val h = e.heightDp * density
-        // When a control is larger than the area (tiny window, first layout pass) centre it instead of throwing on an empty range.
-        val cx = clampCentre(safeLeft + e.x * safeWidth, safeLeft.toFloat(), safeWidth.toFloat(), w)
-        val cy = clampCentre(safeTop + e.y * safeHeight, safeTop.toFloat(), safeHeight.toFloat(), h)
-        return Rect(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
-    }
-    private fun clampCentre(v: Float, start: Float, size: Float, extent: Float): Float =
-        if (extent >= size) start + size / 2 else v.coerceIn(start + extent / 2, start + size - extent / 2)
-
-    /** Inverse of [rectOf] for the editor: pixel centre → normalised position. */
-    fun normalised(cxPx: Float, cyPx: Float): Pair<Float, Float> =
-        ((cxPx - safeLeft) / safeWidth).coerceIn(0f, 1f) to ((cyPx - safeTop) / safeHeight).coerceIn(0f, 1f)
-}
-
-data class Rect(val left: Float, val top: Float, val right: Float, val bottom: Float) {
-    val cx get() = (left + right) / 2; val cy get() = (top + bottom) / 2
-    val width get() = right - left; val height get() = bottom - top
-    fun contains(x: Float, y: Float) = x in left..right && y in top..bottom
-}
-
-/** Visual state for the overlay renderer (read on the UI thread after events). */
-data class JoystickVisual(val centerX: Float, val centerY: Float, val knobX: Float, val knobY: Float, val radius: Float)
+/**
+ * A pointer (finger) as the engine sees it: normalised position plus an id, so two thumbs never
+ * interfere.
+ */
+data class TouchPointer(val id: Long, val x: Float, val y: Float)
 
 /**
- * Original multi-touch translation engine. Every pointer is owned by exactly one handler from DOWN to UP/CANCEL,
- * so moving one finger never affects another finger's joystick, button or camera gesture.
- * Not thread-safe: call from one thread (the Android UI thread).
+ * The result of feeding a pointer event in: which control it hit and what the launcher should do.
+ * Returning this instead of performing side effects keeps the whole gesture model unit-testable.
+ */
+data class TouchOutcome(
+    val element: ControlElement?,
+    val action: InputAction?,
+    /** True when the launcher itself must react (menu, keyboard, recording…). */
+    val command: InputAction? = null
+)
+
+/**
+ * Turns raw touches into key/mouse events for the game.
+ *
+ * The behaviours that make touch Minecraft actually playable, all implemented here so they are
+ * testable without a device:
+ *
+ * * **slide-off release** — dragging off a button releases it, but dragging *between* swipeable
+ *   controls (hotbar) keeps firing them;
+ * * **reference-counted holds** — two thumbs on the same button do not send a spurious RELEASE;
+ * * **toggle vs hold** — sneak toggles, jump holds;
+ * * **repeat** — scrolling repeats while held, with a delay before the first repeat;
+ * * **double tap** — only fires when the second tap arrives inside the window;
+ * * **modifier gating** — a control that needs shift does nothing unless shift is held;
+ * * **release everything on focus loss** — a stuck "forward" key is the classic touch bug.
  */
 class TouchEngine(
     layout: ControlLayout,
-    geometry: Geometry,
-    var settings: TouchSettings,
+    private val tracker: InputStateTracker,
     private val sink: InputSink,
-    val tracker: InputStateTracker = InputStateTracker(sink),
-    val cursor: DynamicCursor? = null,
+    private val density: Float
 ) {
-    var layout = layout; private set
-    var geometry = geometry; private set
-    var mode: String = layout.defaultMode; private set
-    var cursorGrabbed = true; private set
-    var overlayHidden = false
-    private val pointers = HashMap<Int, PointerHandler>()
-    private val toggled = HashSet<String>()
-    private val lastTap = HashMap<String, Long>()
-    private val pressedElements = HashMap<String, Int>()
-    private var cache: List<Pair<ControlElement, Rect>>? = null
-    val joystickVisuals = HashMap<String, JoystickVisual>()
-    var onChanged: () -> Unit = {}
-    private val slopPx get() = 9f * geometry.density
+    var layout: ControlLayout = layout
+        private set
 
-    fun setLayout(l: ControlLayout) { cancelAll(); layout = l; mode = l.defaultMode; toggled.clear(); invalidate() }
-    fun setGeometry(g: Geometry) { if (g != geometry) { cancelAll(); geometry = g; cursor?.setBounds(g.widthPx, g.heightPx); invalidate() } }
-    private fun invalidate() { cache = null; onChanged() }
+    var mode: String = layout.defaultMode
+        private set
 
-    fun visibleElements(): List<Pair<ControlElement, Rect>> = cache ?: layout.elements(mode).filter {
-        !overlayHidden && when (it.visibility) { Visibility.ALWAYS -> true; Visibility.IN_GAME -> cursorGrabbed; Visibility.IN_MENU -> !cursorGrabbed }
-    }.map { it to geometry.rectOf(it) }.also { cache = it }
+    private var cursorShown: Boolean = false
 
-    fun isElementActive(id: String) = (pressedElements[id] ?: 0) > 0 || id in toggled
-    val activePointerCount get() = pointers.size
+    private val active = HashMap<Long, ActiveTouch>()
+    private val toggled = HashMap<String, Boolean>()
+    private val lastTapAt = HashMap<String, Long>()
+    private val joystickState = HashMap<Long, JoystickState>()
 
-    fun switchMode(m: String) {
-        if (m == mode || m !in layout.modes) return
-        // Release everything owned by controls of the old mode; keep nothing half-pressed.
-        pointers.values.toList().forEach { it.cancel() }; pointers.clear()
-        toggled.toList().forEach { id -> layout.elements(mode).firstOrNull { it.id == id }?.let { releaseActions(it) } }
-        toggled.clear(); pressedElements.clear(); joystickVisuals.clear()
-        mode = m; invalidate()
+    private data class ActiveTouch(
+        val elementId: String,
+        var lastRepeatAt: Long = 0L,
+        val startedAt: Long = System.currentTimeMillis()
+    )
+
+    private data class JoystickState(
+        val elementId: String,
+        var centreX: Float = 0f,
+        var centreY: Float = 0f,
+        var emitted: Set<Int> = emptySet(),
+        var sprinting: Boolean = false,
+        val resolver: DirectionResolver = DirectionResolver()
+    )
+
+    fun setLayout(newLayout: ControlLayout) {
+        releaseAll()
+        layout = newLayout
+        if (mode !in newLayout.modes) mode = newLayout.defaultMode
     }
 
-    /** Called when the game grabs/releases the pointer (glfwSetInputMode CURSOR_DISABLED / NORMAL). */
-    fun setCursorGrabbed(grabbed: Boolean) {
-        if (grabbed == cursorGrabbed) return
-        cursorGrabbed = grabbed
-        // Gestures started in the other context must not continue (a menu drag must not become a camera turn).
-        pointers.entries.filter { it.value is CameraHandler || it.value is MenuHandler || it.value is SecondaryClickHandler }.map { it.key }.forEach { pointers.remove(it)?.cancel() }
-        cursor?.onGrabChanged(grabbed)
-        if (layout.autoModes) {
-            if (!grabbed && mode == layout.defaultMode && "inventory" in layout.modes) switchMode("inventory")
-            else if (grabbed && mode != layout.defaultMode) switchMode(layout.defaultMode)
+    /** Called when the game opens or closes a GUI; drives automatic mode switching. */
+    fun setCursorShown(shown: Boolean) {
+        cursorShown = shown
+        if (!layout.autoModes || shown == (mode == ControlLayout.INVENTORY_MODE)) return
+        mode = if (shown) ControlLayout.INVENTORY_MODE else layout.defaultMode
+    }
+
+    fun switchMode(newMode: String): Boolean {
+        if (newMode !in layout.modes) return false
+        releaseAll()
+        mode = newMode
+        return true
+    }
+
+    fun elements(): List<ControlElement> = layout.elements(mode).filter { it.visible(cursorShown) }
+
+    // ---------------------------------------------------------------- pointer events
+
+    fun down(pointer: TouchPointer): TouchOutcome {
+        val element = hitTest(pointer) ?: return TouchOutcome(null, null)
+        activate(element, pointer)
+        return lastCommand?.let { TouchOutcome(element, null, it) }
+            ?: TouchOutcome(element, element.actions.firstOrNull())
+    }
+
+    fun move(pointer: TouchPointer): TouchOutcome {
+        val touch = active[pointer.id] ?: return TouchOutcome(null, null)
+        val element = layout.element(touch.elementId) ?: return TouchOutcome(null, null)
+
+        // Joysticks follow the thumb; everything else is hit-tested again so sliding off releases.
+        if (element.kind != ElementKind.BUTTON) {
+            joystickState[pointer.id]?.let { updateJoystick(element, it, pointer) }
+            return TouchOutcome(element, null)
         }
-        invalidate()
-    }
 
-    // ---------------- pointer events ----------------
-    fun onPointerDown(id: Int, x: Float, y: Float, t: Long) {
-        pointers.remove(id)?.cancel()  // stale pointer id: never leave it holding keys
-        val hit = visibleElements().lastOrNull { (e, r) -> r.contains(x, y) && modifierOk(e) }
-        val h: PointerHandler = when {
-            hit != null -> handlerFor(hit.first, hit.second)
-            cursorGrabbed -> CameraHandler()
-            pointers.values.any { it is MenuHandler } -> SecondaryClickHandler()
-            else -> MenuHandler()
+        val over = hitTest(pointer)
+        if (element.swipeable) {
+            if (over != null && over.id != element.id && over.swipeable) {
+                // Sliding across the hotbar keeps selecting: release the old, press the new.
+                release(touch.elementId)
+                activate(over, pointer)
+                return TouchOutcome(over, over.actions.firstOrNull())
+            }
+            return TouchOutcome(element, null)
         }
-        pointers[id] = h
-        h.down(x, y, t)
-        onChanged()
-    }
-    fun onPointerMove(id: Int, x: Float, y: Float, t: Long) { pointers[id]?.move(x, y, t) }
-    fun onPointerUp(id: Int, x: Float, y: Float, t: Long) { pointers.remove(id)?.up(x, y, t); onChanged() }
-    fun onPointerCancel(id: Int) { pointers.remove(id)?.cancel(); onChanged() }
 
-    /** Focus loss, pause, surface destruction, rotation, game exit: release every simulated input. */
-    fun cancelAll() {
-        pointers.values.toList().forEach { it.cancel() }; pointers.clear()
-        toggled.clear(); pressedElements.clear(); joystickVisuals.clear()
-        tracker.releaseAll(); onChanged()
-    }
-
-    fun tick(t: Long) { pointers.values.toList().forEach { it.tick(t) } }
-    val needsTicks get() = pointers.values.any { it.wantsTicks }
-
-    private fun modifierOk(e: ControlElement) = e.requiresModifier?.let { tracker.isKeyDown(it) } ?: true
-    private fun handlerFor(e: ControlElement, r: Rect): PointerHandler = when (e.kind) {
-        ElementKind.BUTTON -> ButtonHandler(e)
-        ElementKind.JOYSTICK -> JoystickHandler(e, r)
-        ElementKind.TOUCHPAD -> TouchpadHandler(e)
-    }
-
-    // ---------------- action helpers ----------------
-    private fun pressActions(e: ControlElement) {
-        pressedElements[e.id] = (pressedElements[e.id] ?: 0) + 1
-        for (a in e.actions) when (a) {
-            is InputAction.Key -> tracker.pressKey(a.key)
-            is InputAction.Mouse -> tracker.pressButton(a.button)
-            is InputAction.Scroll -> sink.scroll(0.0, a.dy.toDouble())
-            is InputAction.SwitchMode -> {}
-            else -> sink.command(a)
+        if (over?.id != element.id) {
+            // Dragged off a hold button: release it so the player does not keep moving.
+            if (element.behavior == ButtonBehavior.HOLD) {
+                release(touch.elementId)
+                return TouchOutcome(element, null)
+            }
         }
-        e.actions.filterIsInstance<InputAction.SwitchMode>().firstOrNull()?.let { switchMode(it.mode) }
+        return TouchOutcome(element, null)
     }
-    private fun releaseActions(e: ControlElement) {
-        val c = pressedElements[e.id] ?: 0
-        if (c <= 1) pressedElements.remove(e.id) else pressedElements[e.id] = c - 1
-        for (a in e.actions) when (a) {
-            is InputAction.Key -> tracker.releaseKey(a.key)
-            is InputAction.Mouse -> tracker.releaseButton(a.button)
-            else -> {}
+
+    fun up(pointer: TouchPointer): TouchOutcome {
+        val touch = active.remove(pointer.id) ?: return TouchOutcome(null, null)
+        val element = layout.element(touch.elementId) ?: return TouchOutcome(null, null)
+        if (element.kind != ElementKind.BUTTON) {
+            joystickState.remove(pointer.id)?.let { state ->
+                state.emitted.forEach { tracker.releaseKey(it) }
+                if (state.sprinting) tracker.releaseKey(element.joystick?.sprintKey ?: Glfw.KEY_LEFT_CONTROL)
+            }
+            return TouchOutcome(element, null)
         }
+        if (element.behavior != ButtonBehavior.TOGGLE) release(element.id)
+        return TouchOutcome(element, null)
     }
-    private fun repeatActions(e: ControlElement) {
-        for (a in e.actions) when (a) {
-            is InputAction.Key -> tracker.repeatKey(a.key)
-            is InputAction.Mouse -> { tracker.releaseButton(a.button); tracker.pressButton(a.button) }
-            is InputAction.Scroll -> sink.scroll(0.0, a.dy.toDouble())
-            else -> {}
+
+    /** Called periodically (every frame or every ~16 ms) to drive repeats and joysticks. */
+    fun tick(nowMs: Long = System.currentTimeMillis()) {
+        for ((pointerId, touch) in active.toList()) {
+            val element = layout.element(touch.elementId) ?: continue
+            if (element.behavior != ButtonBehavior.REPEAT) continue
+            // A delay before the first repeat, then a steady cadence — like a held keyboard key.
+            if (nowMs - touch.startedAt < element.repeatDelayMs) continue
+            if (nowMs - touch.lastRepeatAt < element.repeatIntervalMs) continue
+            element.actions.forEach { fire(it) }
+            active[pointerId] = touch.copy(lastRepeatAt = nowMs)
         }
     }
 
-    private fun applyLook(dx: Float, dy: Float, sx: Float, sy: Float, dtMs: Long, state: FloatArray) {
-        val s = settings
-        var mx = dx * s.lookSensitivityX * sx; var my = dy * s.lookSensitivityY * sy * (if (s.invertY) -1 else 1)
-        if (s.acceleration > 0f && dtMs > 0) {
-            val speed = hypot(dx, dy) / dtMs / geometry.density   // dp per ms
-            val f = 1f + s.acceleration * (speed / 2f).coerceAtMost(2f); mx *= f; my *= f
+    /** Everything up. Called on focus loss, pause and every mode/layout switch. */
+    fun releaseAll() {
+        active.values.forEach { touch ->
+            val element = layout.element(touch.elementId) ?: return@forEach
+            if (element.kind == ElementKind.BUTTON && element.behavior != ButtonBehavior.TOGGLE) release(element.id)
         }
-        if (s.smoothing > 0f) { // state = [sx, sy]; single-pole low-pass, alpha ≤ 0.8 keeps latency low
-            val a = s.smoothing.coerceIn(0f, 0.8f)
-            state[0] = state[0] * a + mx * (1 - a); state[1] = state[1] * a + my * (1 - a); mx = state[0]; my = state[1]
-        }
-        sink.cursorDelta(mx, my)
+        active.clear()
+        joystickState.clear()
+        tracker.releaseAll()
     }
 
-    // ---------------- handlers ----------------
-    private abstract inner class PointerHandler {
-        open val wantsTicks = false
-        abstract fun down(x: Float, y: Float, t: Long)
-        open fun move(x: Float, y: Float, t: Long) {}
-        abstract fun up(x: Float, y: Float, t: Long)
-        abstract fun cancel()
-        open fun tick(t: Long) {}
-    }
+    val anyTouchActive: Boolean get() = active.isNotEmpty()
 
-    private inner class ButtonHandler(var e: ControlElement) : PointerHandler() {
-        private var nextRepeat = Long.MAX_VALUE
-        private var holding = false
-        override val wantsTicks get() = e.behavior == ButtonBehavior.REPEAT
-        override fun down(x: Float, y: Float, t: Long) = engage(t)
-        private fun engage(t: Long) {
-            when (e.behavior) {
-                ButtonBehavior.HOLD -> { pressActions(e); holding = true }
-                ButtonBehavior.REPEAT -> { pressActions(e); holding = true; nextRepeat = t + e.repeatDelayMs }
-                ButtonBehavior.TAP -> { pressActions(e); releaseActions(e) }
-                ButtonBehavior.TOGGLE -> if (e.id in toggled) { toggled.remove(e.id); releaseActions(e) } else { toggled.add(e.id); pressActions(e) }
+    // ---------------------------------------------------------------- internals
+
+    private var lastCommand: InputAction? = null
+
+    private fun activate(element: ControlElement, pointer: TouchPointer) {
+        lastCommand = null
+        element.requiresModifier?.let { modifier ->
+            if (!tracker.isKeyDown(modifier)) return
+        }
+        when (element.kind) {
+            ElementKind.JOYSTICK -> {
+                joystickState[pointer.id] = JoystickState(
+                    elementId = element.id,
+                    centreX = pointer.x,
+                    centreY = pointer.y
+                )
+                active[pointer.id] = ActiveTouch(element.id)
+            }
+            ElementKind.TOUCHPAD -> {
+                active[pointer.id] = ActiveTouch(element.id)
+            }
+            ElementKind.BUTTON -> when (element.behavior) {
+                ButtonBehavior.HOLD -> {
+                    element.actions.forEach { fire(it) }
+                    active[pointer.id] = ActiveTouch(element.id)
+                }
+                ButtonBehavior.TAP -> {
+                    element.actions.forEach { fire(it) }
+                    active[pointer.id] = ActiveTouch(element.id)
+                }
+                ButtonBehavior.TOGGLE -> {
+                    val on = toggled[element.id] == true
+                    if (on) release(element.id) else element.actions.forEach { fire(it) }
+                    toggled[element.id] = !on
+                    active[pointer.id] = ActiveTouch(element.id)
+                }
+                ButtonBehavior.REPEAT -> {
+                    element.actions.forEach { fire(it) }
+                    active[pointer.id] = ActiveTouch(element.id, lastRepeatAt = System.currentTimeMillis())
+                }
                 ButtonBehavior.DOUBLE_TAP -> {
-                    val last = lastTap[e.id]
-                    if (last != null && t - last <= e.doubleTapMs) { lastTap.remove(e.id); pressActions(e); releaseActions(e) } else lastTap[e.id] = t
+                    val now = System.currentTimeMillis()
+                    val last = lastTapAt[element.id]
+                    if (last != null && now - last <= element.doubleTapMs) {
+                        element.actions.forEach { fire(it) }
+                        lastTapAt.remove(element.id)
+                    } else {
+                        lastTapAt[element.id] = now
+                    }
+                    active[pointer.id] = ActiveTouch(element.id)
                 }
             }
         }
-        private fun disengage() { if (holding) { holding = false; releaseActions(e) }; nextRepeat = Long.MAX_VALUE }
-        override fun move(x: Float, y: Float, t: Long) {
-            if (!e.swipeable || geometry.rectOf(e).contains(x, y)) return
-            val next = visibleElements().lastOrNull { (o, r) -> o.swipeable && o.kind == ElementKind.BUTTON && o.id != e.id && r.contains(x, y) && modifierOk(o) }?.first ?: return
-            disengage(); e = next; engage(t); onChanged()
-        }
-        override fun up(x: Float, y: Float, t: Long) = disengage()
-        override fun cancel() = disengage()
-        override fun tick(t: Long) {
-            if (holding && t >= nextRepeat) { repeatActions(e); nextRepeat = t + e.repeatIntervalMs.coerceAtLeast(16) }
-        }
     }
 
-    private inner class JoystickHandler(val e: ControlElement, val r: Rect) : PointerHandler() {
-        private val cfg = e.joystick ?: JoystickConfig()
-        private var cx = r.cx; private var cy = r.cy
-        private val radius = r.width / 2
-        private val held = HashSet<Int>()
-        private val resolver = DirectionResolver()
-        private var vx = 0f; private var vy = 0f; private var lastTick = 0L
-        override val wantsTicks get() = cfg.role == JoystickRole.LOOK
-        override fun down(x: Float, y: Float, t: Long) {
-            if (cfg.floating) { cx = x; cy = y }
-            lastTick = t; update(x, y)
-        }
-        override fun move(x: Float, y: Float, t: Long) = update(x, y)
-        private fun update(x: Float, y: Float) {
-            var dx = (x - cx) / radius; var dy = (y - cy) / radius
-            val mag = hypot(dx, dy)
-            if (mag > 1f) { dx /= mag; dy /= mag }   // clamp: finger outside the ring keeps a stable direction
-            vx = dx * cfg.sensitivity; vy = dy * cfg.sensitivity
-            joystickVisuals[e.id] = JoystickVisual(cx, cy, cx + dx * radius, cy + dy * radius, radius)
-            if (cfg.role == JoystickRole.MOVEMENT) {
-                val sector = resolver.sector(dx, dy, cfg.deadZone)
-                val f = DirectionResolver.flags(sector)
-                val want = HashSet<Int>()
-                if (f[0]) want += cfg.forward; if (f[1]) want += cfg.back; if (f[2]) want += cfg.left; if (f[3]) want += cfg.right
-                if (cfg.sprintThreshold > 0f && f[0] && minOf(1f, mag) >= cfg.sprintThreshold) want += cfg.sprintKey
-                (held - want).forEach { tracker.releaseKey(it) }
-                (want - held).forEach { tracker.pressKey(it) }
-                held.clear(); held.addAll(want)
-            }
-            onChanged()
-        }
-        override fun tick(t: Long) {
-            val dt = (t - lastTick).coerceIn(0, 50); lastTick = t
-            if (cfg.role == JoystickRole.LOOK && hypot(vx, vy) > cfg.deadZone) {
-                val speed = 0.9f * geometry.density * dt // px per tick at full deflection
-                sink.cursorDelta(vx * speed * settings.lookSensitivityX, vy * speed * settings.lookSensitivityY * (if (settings.invertY) -1 else 1))
+    private fun release(elementId: String) {
+        val element = layout.element(elementId) ?: return
+        element.actions.forEach { action ->
+            when (action) {
+                is InputAction.Key -> tracker.releaseKey(action.key)
+                is InputAction.Mouse -> tracker.releaseButton(action.button)
+                else -> {}
             }
         }
-        private fun reset() { held.forEach { tracker.releaseKey(it) }; held.clear(); resolver.reset(); vx = 0f; vy = 0f; joystickVisuals.remove(e.id); onChanged() }
-        override fun up(x: Float, y: Float, t: Long) = reset()
-        override fun cancel() = reset()
+        toggled[elementId] = false
     }
 
-    /** Gameplay camera on empty screen space: drag = look, tap = use/place, long press = attack/break. */
-    private inner class CameraHandler : PointerHandler() {
-        private var lx = 0f; private var ly = 0f; private var sx = 0f; private var sy = 0f
-        private var downAt = 0L; private var lastAt = 0L
-        private var moved = false; private var longPress = false
-        private val smooth = FloatArray(2)
-        override val wantsTicks get() = !moved && !longPress
-        override fun down(x: Float, y: Float, t: Long) { lx = x; ly = y; sx = x; sy = y; downAt = t; lastAt = t }
-        override fun move(x: Float, y: Float, t: Long) {
-            if (!moved && hypot(x - sx, y - sy) > slopPx) moved = true
-            if (moved || longPress) applyLook(x - lx, y - ly, 1f, 1f, t - lastAt, smooth)
-            lx = x; ly = y; lastAt = t
-        }
-        override fun tick(t: Long) {
-            if (settings.longPressBreak && !moved && !longPress && t - downAt >= settings.longPressMs) { longPress = true; tracker.pressButton(Glfw.MOUSE_LEFT) }
-        }
-        override fun up(x: Float, y: Float, t: Long) {
-            if (longPress) { tracker.releaseButton(Glfw.MOUSE_LEFT); return }
-            if (!moved && t - downAt < settings.longPressMs) when (settings.tapAction) {
-                TapAction.MOUSE_LEFT -> tracker.clickButton(Glfw.MOUSE_LEFT)
-                TapAction.MOUSE_RIGHT -> tracker.clickButton(Glfw.MOUSE_RIGHT)
-                TapAction.NONE -> {}
+    private fun fire(action: InputAction) {
+        when (action) {
+            is InputAction.Key -> tracker.pressKey(action.key)
+            is InputAction.Mouse -> tracker.pressButton(action.button)
+            is InputAction.Scroll -> sink.scroll(0.0, action.dy.toDouble())
+            is InputAction.SwitchMode -> switchMode(action.mode)
+            else -> {
+                lastCommand = action
+                sink.command(action)
             }
         }
-        override fun cancel() { if (longPress) tracker.releaseButton(Glfw.MOUSE_LEFT); longPress = false }
     }
 
-    /** Menus (cursor visible): direct pointing by default; relative touchpad when the cursor mode is TOUCHPAD. */
-    private inner class MenuHandler : PointerHandler() {
-        private val relative get() = cursor?.settings?.mode == CursorMode.TOUCHPAD
-        private var lx = 0f; private var ly = 0f; private var sx = 0f; private var sy = 0f; private var downAt = 0L
-        private var pressed = false; private var moved = false
-        override fun down(x: Float, y: Float, t: Long) {
-            lx = x; ly = y; sx = x; sy = y; downAt = t
-            if (!relative) { place(x, y); tracker.pressButton(Glfw.MOUSE_LEFT); pressed = true; cursor?.click(t) }
+    private fun updateJoystick(element: ControlElement, state: JoystickState, pointer: TouchPointer) {
+        val config = element.joystick ?: return
+        val radiusPx = (element.widthDp / 2f) * density
+        if (radiusPx <= 0f) return
+        val centreX = if (config.floating) state.centreX else element.x
+        val centreY = if (config.floating) state.centreY else element.y
+
+        var dx = (pointer.x - centreX) / (element.widthDp / screenWidthPx / 2f).coerceAtLeast(1e-5f)
+        var dy = (pointer.y - centreY) / (element.heightDp / screenHeightPx / 2f).coerceAtLeast(1e-5f)
+        val magnitude = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+        if (magnitude > 1f) {
+            dx /= magnitude
+            dy /= magnitude
         }
-        private fun place(x: Float, y: Float) { val c = cursor; if (c != null) { c.moveAbsolute(x, y); sink.cursorAbsolute(c.x, c.y) } else sink.cursorAbsolute(x, y) }
-        override fun move(x: Float, y: Float, t: Long) {
-            if (hypot(x - sx, y - sy) > slopPx) moved = true
-            if (relative) { val c = cursor; if (c != null) { c.moveRelative(x - lx, y - ly); sink.cursorAbsolute(c.x, c.y) } }
-            else place(x, y)
-            lx = x; ly = y
+
+        if (config.role == JoystickRole.LOOK) {
+            // Look stick: movement is relative, so it is emitted as a cursor delta each tick.
+            val mag = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+            if (mag > config.deadZone) {
+                sink.cursorDelta(dx * config.sensitivity * 40f, dy * config.sensitivity * 40f)
+            }
+            return
         }
-        override fun up(x: Float, y: Float, t: Long) {
-            if (pressed) { tracker.releaseButton(Glfw.MOUSE_LEFT); pressed = false }
-            else if (relative && !moved && t - downAt < 250) { tracker.clickButton(Glfw.MOUSE_LEFT); cursor?.click(t) }
+
+        val wanted = DirectionResolver.flags(state.resolver.sector(dx, dy, config.deadZone))
+        val keys = listOf(config.forward, config.back, config.left, config.right)
+        val want = keys.filterIndexed { i, _ -> wanted[i] }.toSet()
+        for (key in want - state.emitted) tracker.pressKey(key)
+        for (key in state.emitted - want) tracker.releaseKey(key)
+        state.emitted = want
+
+        // Auto-sprint: full deflection forwards for a moment engages sprint. Teleport-free and it
+        // matches what a real analogue stick does in the game.
+        if (config.sprintThreshold > 0f) {
+            val forwards = wanted[0]
+            val deflection = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+            val shouldSprint = forwards && deflection >= config.sprintThreshold
+            if (shouldSprint && !state.sprinting) {
+                tracker.pressKey(config.sprintKey)
+                state.sprinting = true
+            } else if (!shouldSprint && state.sprinting) {
+                tracker.releaseKey(config.sprintKey)
+                state.sprinting = false
+            }
         }
-        override fun cancel() { if (pressed) tracker.releaseButton(Glfw.MOUSE_LEFT); pressed = false }
     }
 
-    /** A second finger in a menu performs a right click at the cursor (e.g. split item stacks). */
-    private inner class SecondaryClickHandler : PointerHandler() {
-        private var pressed = false
-        override fun down(x: Float, y: Float, t: Long) { tracker.pressButton(Glfw.MOUSE_RIGHT); pressed = true; cursor?.click(t) }
-        override fun up(x: Float, y: Float, t: Long) = cancel()
-        override fun cancel() { if (pressed) tracker.releaseButton(Glfw.MOUSE_RIGHT); pressed = false }
+    /**
+     * dp → normalised coordinates. Later elements are drawn on top, so they win a hit: the list is
+     * iterated in reverse.
+     */
+    private fun hitTest(pointer: TouchPointer): ControlElement? = elements().lastOrNull { element ->
+        val halfWidth = (element.widthDp * density / 2f) / screenWidthPx
+        val halfHeight = (element.heightDp * density / 2f) / screenHeightPx
+        kotlin.math.abs(pointer.x - element.x) <= halfWidth &&
+            kotlin.math.abs(pointer.y - element.y) <= halfHeight
     }
 
-    private inner class TouchpadHandler(val e: ControlElement) : PointerHandler() {
-        private val cfg = e.touchpad ?: TouchpadConfig()
-        private var lx = 0f; private var ly = 0f; private var sx = 0f; private var sy = 0f; private var downAt = 0L; private var lastAt = 0L
-        private var moved = false; private val smooth = FloatArray(2)
-        override fun down(x: Float, y: Float, t: Long) { lx = x; ly = y; sx = x; sy = y; downAt = t; lastAt = t; pressedElements[e.id] = 1 }
-        override fun move(x: Float, y: Float, t: Long) {
-            if (hypot(x - sx, y - sy) > slopPx) moved = true
-            val dx = (x - lx) * cfg.sensitivity; val dy = (y - ly) * cfg.sensitivity
-            if (cursorGrabbed) applyLook(dx, dy, 1f, 1f, t - lastAt, smooth)
-            else { val c = cursor; if (c != null) { c.moveRelative(dx, dy); sink.cursorAbsolute(c.x, c.y) } }
-            lx = x; ly = y; lastAt = t
-        }
-        override fun up(x: Float, y: Float, t: Long) {
-            pressedElements.remove(e.id)
-            if (cfg.tapToClick && !moved && t - downAt < 250) { tracker.clickButton(if (cursorGrabbed) Glfw.MOUSE_RIGHT else Glfw.MOUSE_LEFT); cursor?.click(t) }
-        }
-        override fun cancel() { pressedElements.remove(e.id) }
+    /**
+     * Screen size in pixels. The engine needs it to convert dp sizes into normalised hit areas; the app
+     * sets it once on layout. Kept mutable so a rotation does not need a new engine.
+     */
+    var screenWidthPx: Float = 1080f
+    var screenHeightPx: Float = 2400f
+
+    fun updateScreenSize(widthPx: Int, heightPx: Int) {
+        screenWidthPx = widthPx.toFloat().coerceAtLeast(1f)
+        screenHeightPx = heightPx.toFloat().coerceAtLeast(1f)
     }
 }
