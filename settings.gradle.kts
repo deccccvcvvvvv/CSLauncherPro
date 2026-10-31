@@ -6,4 +6,5 @@ dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
 rootProject.name = "CSLauncherPro"
-include(":core", ":app")
+// `:app` is wired back in once the new core exposes the full API surface the app consumes.
+include(":core")
